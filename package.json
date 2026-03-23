@@ -1,0 +1,27 @@
+{
+  "name": "liberty_tools_webhooks",
+  "version": "1.0.0",
+  "description": "",
+  "homepage": "https://github.com/chillingcone426/ERLCGateway#readme",
+  "bugs": {
+    "url": "https://github.com/chillingcone426/ERLCGateway/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chillingcone426/ERLCGateway.git"
+  },
+  "license": "ISC",
+  "author": "thebeston123",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "crypto": "^1.0.1",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "fs": "^0.0.1-security",
+    "https": "^1.0.0"
+  }
+}
