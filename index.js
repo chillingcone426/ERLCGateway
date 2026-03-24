@@ -33,14 +33,20 @@ const publicKey = crypto.createPublicKey({
   });
 
 function reject(res, status, reason, extra = {}) {
-    console.warn('[ERLC webhook] rejected request', { //console log info on rejected request
-      status,
-      reason,
-      ...extra,
-    });
-    console.log('Body (truncated):', res.req.body?.slice(0, 100)); //log first 100 bytes of body for debugging
-    return res.status(status).json({ error: reason }); //simply just return the data as needed
-  }
+  console.warn('[ERLC webhook] rejected request', {
+    status,
+    reason,
+    ...extra,
+  });
+
+  const bodyPreview = Buffer.isBuffer(res.req.body)
+    ? res.req.body.toString('utf8').slice(0, 500)
+    : res.req.body;
+
+  console.log('Body (preview):', bodyPreview);
+
+  return res.status(status).json({ error: reason });
+}
 
 function isTimestampFresh(timestampString, maxSkewSeconds) {
   if (!/^\d+$/.test(timestampString)) {
