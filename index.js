@@ -81,6 +81,7 @@ app.get('/health', (_req, res) => {
     res.json({ ok: true, service: 'erlc-webhook-test-service' });
   });
 
+
 app.get("/webhooks", async (req, res) => {
   try {
     const authHeader = req.header('Authorization');
@@ -104,7 +105,7 @@ app.get("/webhooks", async (req, res) => {
   }
 });
 
-app.delete("/webhook/:id", async (req, res) => {
+app.delete("/webhook/:id", express.json(), async (req, res) => {
   try {
     const authHeader = req.header('Authorization');
     if (authHeader !== `Bearer ${webhookCreatedAuthToken}`) {
@@ -175,6 +176,59 @@ app.post('/webhook/create', express.json(), async (req, res) => {
     res.status(500).json({ error: "Internal error" });
   } 
   });  
+
+  app.patch("/webhook/:id", express.json(),async (req, res) => {
+  try {
+    const authHeader = req.header('Authorization');
+    if (authHeader !== `Bearer ${webhookCreatedAuthToken}`) {
+      console.warn('Received /webhook/create with invalid Authorization header:', authHeader);
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const { webhookURL, mode, discordID } = req.body;
+
+    const update = {};
+
+    if (webhookURL !== undefined) update.webhookURL = webhookURL;
+    if (mode !== undefined) update.mode = mode;
+    if (discordID !== undefined) update.discordID = discordID;
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({
+        error: "Nothing to update"
+      });
+    }
+
+    console.log(`Received /webhook/${req.params.id} update with body:`, req.body);
+
+    const find = await webhooks.findOne({ webhookId: req.params.id });
+
+    if (!find) {
+        console.warn(`Webhook with ID ${req.params.id} not found for update`);
+    }
+
+    const result = await webhooks.findOneAndUpdate(
+      { webhookId: req.params.id },
+      { $set: update },
+      { returnDocument: "after" }
+    );
+
+    if (!result.value) {
+      return res.status(404).json({
+        error: "Webhook not found"
+      });
+    }
+
+    res.json({
+      success: true,
+      webhook: result.value
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
 
 app.use(express.raw({ type: () => true, limit: '2mb' })); //parse body as raw bytes for signature verification
 
@@ -257,14 +311,40 @@ app.post('/webhook/erlc/:id', async (req, res) => {
 
     // send to stored webhook
     if (webhook.mode === "proxy") {
-      fetch(webhook.webhookURL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(event)
-      }).catch(console.error);
+        console.log(`[ERLC webhook] forwarding event to ${webhook.webhookURL}`);
+      await fetch(webhook.webhookURL, {
+  method: "POST",
+  headers: {
+    "Content-Type": req.headers["content-type"],
+    "X-Signature-Timestamp": req.headers["x-signature-timestamp"],
+    "X-Signature-Ed25519": req.headers["x-signature-ed25519"]
+  },
+  body: req.body
+}).catch(console.error);
     }
+
+    if (webhook.mode === "easy") {
+  const body = JSON.parse(req.body.toString("utf8"));
+
+  const event = body.events?.[0];
+
+  const easyPayload = {
+    event: event?.event,
+    userId: event?.origin,
+    timestamp: event?.timestamp,
+    command: event?.data?.command,
+    argument: event?.data?.argument,
+    server: body.server
+  };
+
+  await fetch(webhook.webhookURL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(easyPayload)
+  }).catch(console.error);
+}
 
     return res.status(204).send();
 });
