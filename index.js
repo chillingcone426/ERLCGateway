@@ -39,12 +39,6 @@ function reject(res, status, reason, extra = {}) {
     ...extra,
   });
 
-  const bodyPreview = Buffer.isBuffer(res.req.body)
-    ? res.req.body.toString('utf8').slice(0, 500)
-    : res.req.body;
-
-  console.log('Body (preview):', bodyPreview);
-
   return res.status(status).json({ error: reason });
 }
 
@@ -58,6 +52,41 @@ function isTimestampFresh(timestampString, maxSkewSeconds) {
   const skew = Math.abs(nowTs - requestTs); //calculate time difference
 
   return skew <= maxSkewSeconds;
+}
+
+function validateWebhookPayload(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, reason: 'Payload must be a JSON object' };
+  }
+
+  if (!Array.isArray(body.events) || body.events.length === 0) {
+    return { ok: false, reason: 'Payload must include a non-empty events array' };
+  }
+
+  for (let i = 0; i < body.events.length; i += 1) {
+    const event = body.events[i];
+    if (!event || typeof event !== 'object' || Array.isArray(event)) {
+      return { ok: false, reason: `events[${i}] must be an object` };
+    }
+
+    if (typeof event.event !== 'string' || event.event.trim() === '') {
+      return { ok: false, reason: `events[${i}].event must be a non-empty string` };
+    }
+
+    if (typeof event.origin !== 'string' || event.origin.trim() === '') {
+      return { ok: false, reason: `events[${i}].origin must be a non-empty string` };
+    }
+
+    if (typeof event.timestamp !== 'number' && typeof event.timestamp !== 'string') {
+      return { ok: false, reason: `events[${i}].timestamp must be a string or number` };
+    }
+
+    if (event.data !== undefined && (typeof event.data !== 'object' || event.data === null || Array.isArray(event.data))) {
+      return { ok: false, reason: `events[${i}].data must be an object when provided` };
+    }
+  }
+
+  return { ok: true };
 }
 
 const receivedEvents = []; //debug store for received events
@@ -296,7 +325,6 @@ app.get("/webhook/:id/events", async (req, res) => {
 app.use(express.raw({ type: () => true, limit: '2mb' })); //parse body as raw bytes for signature verification
 
 app.post('/webhook/erlc/:id', async (req, res) => {
-
     const webhook = await webhooks.findOne({
       webhookId: req.params.id
     });
@@ -348,7 +376,10 @@ app.post('/webhook/erlc/:id', async (req, res) => {
       return reject(res, 400, 'Invalid JSON');
     }
 
-    console.log('[ERLC webhook] accepted event');
+    const payloadValidation = validateWebhookPayload(body);
+    if (!payloadValidation.ok) {
+      return reject(res, 400, payloadValidation.reason);
+    }
 
     // -------------------------
     // MODES (only valid requests reach here)
@@ -357,15 +388,25 @@ app.post('/webhook/erlc/:id', async (req, res) => {
     if (webhook.mode === "proxy") {
       console.log(`[ERLC webhook] proxy → ${webhook.webhookURL}`);
 
-      await fetch(webhook.webhookURL, {
-        method: "POST",
-        headers: {
-          "Content-Type": req.headers["content-type"],
-          "X-Signature-Timestamp": timestamp,
-          "X-Signature-Ed25519": signatureHex
-        },
-        body: req.body
-      }).catch(console.error);
+      let proxyResponse;
+      try {
+        proxyResponse = await fetch(webhook.webhookURL, {
+          method: "POST",
+          headers: {
+            "Content-Type": req.headers["content-type"],
+            "X-Signature-Timestamp": timestamp,
+            "X-Signature-Ed25519": signatureHex
+          },
+          body: req.body
+        });
+      } catch (err) {
+        console.error('[ERLC webhook] proxy delivery failed', err);
+        return reject(res, 502, 'Proxy delivery failed');
+      }
+
+      if (!proxyResponse.ok) {
+        return reject(res, 502, `Proxy endpoint rejected request (${proxyResponse.status})`);
+      }
     }
 
     else if (webhook.mode === "easy") {
@@ -379,11 +420,21 @@ app.post('/webhook/erlc/:id', async (req, res) => {
         server: body.server
       };
 
-      await fetch(webhook.webhookURL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(easyPayload)
-      }).catch(console.error);
+      let easyResponse;
+      try {
+        easyResponse = await fetch(webhook.webhookURL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(easyPayload)
+        });
+      } catch (err) {
+        console.error('[ERLC webhook] easy delivery failed', err);
+        return reject(res, 502, 'Easy delivery failed');
+      }
+
+      if (!easyResponse.ok) {
+        return reject(res, 502, `Easy endpoint rejected request (${easyResponse.status})`);
+      }
     }
 
     else if (webhook.mode === "poll") {
@@ -413,6 +464,9 @@ app.post('/webhook/erlc/:id', async (req, res) => {
     });
   }
 }
+    else {
+      return reject(res, 400, `Unsupported webhook mode: ${webhook.mode}`);
+    }
 
     return res.sendStatus(204);
 });
