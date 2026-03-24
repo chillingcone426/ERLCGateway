@@ -59,6 +59,8 @@ const app = express();
 
 const client = new MongoClient("mongodb://127.0.0.1:27017"); //temp for testing
 
+let webhookEvents;
+
 async function start() {
   await client.connect();
 
@@ -66,6 +68,13 @@ async function start() {
   webhooks = db.collection("webhooks");
 
   await webhooks.createIndex({ webhookId: 1 }, { unique: true });
+
+  webhookEvents = db.collection("webhookEvents");
+
+  await webhookEvents.createIndex(
+  { createdAt: 1 },
+  { expireAfterSeconds: 600 }
+    );
 
   console.log("MongoDB connected");
 }
@@ -230,6 +239,53 @@ app.post('/webhook/create', express.json(), async (req, res) => {
   }
 });
 
+app.get("/webhook/:id/events", async (req, res) => {
+  try {
+    // check webhook exists
+    const webhook = await webhooks.findOne({
+      webhookId: req.params.id
+    });
+
+    if (!webhook) {
+      return res.status(404).json({
+        error: "Webhook not found"
+      });
+    }
+
+    // check correct mode
+    if (webhook.mode !== "poll") {
+      return res.status(400).json({
+        error: "Webhook is not in poll mode",
+        mode: webhook.mode
+      });
+    }
+
+    // fetch events
+    const events = await webhookEvents
+      .find({ webhookId: req.params.id })
+      .sort({ createdAt: 1 })
+      .limit(50)
+      .toArray();
+
+    // return first
+    res.json({
+      count: events.length,
+      events
+    });
+
+    // then delete (queue behavior)
+    if (events.length > 0) {
+      await webhookEvents.deleteMany({
+        _id: { $in: events.map(e => e._id) }
+      });
+    }
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 app.use(express.raw({ type: () => true, limit: '2mb' })); //parse body as raw bytes for signature verification
 
 app.post('/webhook/erlc/:id', async (req, res) => {
@@ -246,105 +302,110 @@ app.post('/webhook/erlc/:id', async (req, res) => {
     const signatureHex = req.header('X-Signature-Ed25519');
     const contentType = req.header('Content-Type');
 
-    console.log('[ERLC webhook] received request with headers:', {
-      timestamp,
-      signatureHex,
-      contentType,
-      webhookId: req.params.id
-    });
-
     if (!Buffer.isBuffer(req.body)) {
       return reject(res, 400, 'Body must be raw bytes.', { contentType });
     }
 
     if (!timestamp || !signatureHex) {
-      return reject(res, 400, 'Missing required headers: X-Signature-Timestamp and X-Signature-Ed25519.', {
-        contentType,
-      });
+      return reject(res, 400, 'Missing required headers');
     }
 
     if (!/^\d+$/.test(timestamp)) {
-      return reject(res, 400, 'Timestamp must be a unix timestamp string.', { timestamp });
+      return reject(res, 400, 'Timestamp must be unix');
     }
 
     if (!isTimestampFresh(timestamp, 300)) {
-      return reject(res, 400, 'Timestamp is outside allowed skew window.', {
-        timestamp,
-        maxTimestampSkewSeconds: 300,
-      });
+      return reject(res, 400, 'Timestamp expired');
     }
 
-    if (!/^[a-fA-F0-9]+$/.test(signatureHex) || signatureHex.length % 2 !== 0) {
-      return reject(res, 400, 'Signature must be valid hex.');
+    if (!/^[a-fA-F0-9]+$/.test(signatureHex)) {
+      return reject(res, 400, 'Invalid signature format');
     }
 
     let valid;
     try {
       valid = verifySignature(timestamp, req.body, signatureHex, publicKey);
     } catch (err) {
-      return reject(res, 400, 'Signature verification input is malformed.', { detail: err.message });
+      return reject(res, 400, 'Malformed signature');
     }
 
     if (!valid) {
       return reject(res, 401, 'Invalid signature.');
     }
 
-    let event;
+    // ✅ only parse AFTER validation
+    let body;
     try {
-      event = JSON.parse(req.body.toString('utf8'));
-    } catch (_err) {
-      return reject(res, 400, 'Body must be valid JSON.', { contentType });
+      body = JSON.parse(req.body.toString('utf8'));
+    } catch {
+      return reject(res, 400, 'Invalid JSON');
     }
-
-    const envelope = {
-      webhookId: req.params.id,
-      receivedAt: new Date().toISOString(),
-      timestamp,
-      query: req.query,
-      event,
-    };
 
     console.log('[ERLC webhook] accepted event');
-    console.log(JSON.stringify(envelope, null, 2));
 
-    console.log('[ERLC webhook] raw body:', req.body.toString('utf8'));
+    // -------------------------
+    // MODES (only valid requests reach here)
+    // -------------------------
 
-    // send to stored webhook
     if (webhook.mode === "proxy") {
-        console.log(`[ERLC webhook] forwarding event to ${webhook.webhookURL}`);
+      console.log(`[ERLC webhook] proxy → ${webhook.webhookURL}`);
+
       await fetch(webhook.webhookURL, {
-  method: "POST",
-  headers: {
-    "Content-Type": req.headers["content-type"],
-    "X-Signature-Timestamp": req.headers["x-signature-timestamp"],
-    "X-Signature-Ed25519": req.headers["x-signature-ed25519"]
-  },
-  body: req.body
-}).catch(console.error);
+        method: "POST",
+        headers: {
+          "Content-Type": req.headers["content-type"],
+          "X-Signature-Timestamp": timestamp,
+          "X-Signature-Ed25519": signatureHex
+        },
+        body: req.body
+      }).catch(console.error);
     }
 
-    if (webhook.mode === "easy") {
-  const body = JSON.parse(req.body.toString("utf8"));
+    else if (webhook.mode === "easy") {
+      const e = body.events?.[0];
 
-  const event = body.events?.[0];
+      const easyPayload = {
+        event: e?.event,
+        userId: e?.origin,
+        timestamp: e?.timestamp,
+        ...e?.data,
+        server: body.server
+      };
 
-  const easyPayload = {
-    event: event?.event,
-    userId: event?.origin,
-    timestamp: event?.timestamp,
-    command: event?.data?.command,
-    argument: event?.data?.argument,
-    server: body.server
-  };
+      await fetch(webhook.webhookURL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(easyPayload)
+      }).catch(console.error);
+    }
 
-  await fetch(webhook.webhookURL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(easyPayload)
-  }).catch(console.error);
+    else if (webhook.mode === "poll") {
+
+  const events = body.events.map(e => ({
+    webhookId: webhook.webhookId,
+    event: e.event,
+    userId: e.origin,
+    timestamp: e.timestamp,
+    ...e.data,
+    server: body.server,
+    createdAt: new Date()
+  }));
+
+  await webhookEvents.insertMany(events);
+
+  // keep only newest 50
+  const overflow = await webhookEvents
+    .find({ webhookId: webhook.webhookId })
+    .sort({ createdAt: -1 })
+    .skip(50)
+    .toArray();
+
+  if (overflow.length > 0) {
+    await webhookEvents.deleteMany({
+      _id: { $in: overflow.map(e => e._id) }
+    });
+  }
 }
 
-    return res.status(204).send();
+    return res.sendStatus(204);
 });
