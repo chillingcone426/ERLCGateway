@@ -38,6 +38,7 @@ function reject(res, status, reason, extra = {}) {
       reason,
       ...extra,
     });
+    console.log('Body (truncated):', res.req.body?.slice(0, 100)); //log first 100 bytes of body for debugging
     return res.status(status).json({ error: reason }); //simply just return the data as needed
   }
 
