@@ -43,6 +43,11 @@ Receives a JSON payload and logs it.
 - Headers:
   - `Content-Type: application/json`
   - `Authorization: Bearer <WEBHOOK_CREATED_AUTH_TOKEN>`
+- Body rules:
+  - `robloxID` is required
+  - `username` is required and must be a non-empty string
+  - `mode` is required: `poll`, `easy`, or `proxy`
+  - `webhookURL` is optional for `poll`, required for `easy` and `proxy`
 - Response: `204 No Content` on success
 
 Example:
@@ -51,7 +56,7 @@ Example:
 curl -i -X POST http://localhost:3000/webhook/create \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your_webhook_created_auth_token" \
-  -d '{"discordID":"1234567890","webhookURL": "website", "mode": "poll, easy, proxy"}'
+  -d '{"robloxID":"1234567890","username":"example_user","mode":"poll"}'
 ```
 
 ### `POST /webhook/erlc`
@@ -74,5 +79,30 @@ Common error responses:
 - `PORT` (default: `3000`)
 - `PUBLIC_KEY_BASE64` (Ed25519 public key, base64-encoded DER/SPKI)
 - `WEBHOOK_CREATED_AUTH_TOKEN` (Bearer token for `/webhook/create`)
+- `MONGO_URI` (default: `mongodb://127.0.0.1:27017`)
+- `MONGO_DB_NAME` (default: `erlc_gateway`)
 - `V1_API_BASE_URL` (currently loaded but not required for current endpoints)
 - `V1_SERVER_KEY` (currently loaded but not required for current endpoints)
+
+## MongoDB
+
+The service stores webhook configs and queued events in MongoDB.
+
+- Connection string in code: `mongodb://127.0.0.1:27017`
+- Database name: `erlc_gateway`
+- Collections:
+  - `webhooks`: webhook registrations
+  - `webhookEvents`: queued poll-mode events
+
+### Indexes
+
+- `webhooks.webhookId` unique index
+- `webhookEvents.createdAt` TTL index (`expireAfterSeconds: 600`), so events expire after 10 minutes
+
+### Collection Format Reference
+
+See `docs/mongodb-collections-format.md` for field-by-field formats and example documents.
+
+You can also fetch format metadata from the running API:
+
+- `GET /meta/collections-format`

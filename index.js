@@ -18,6 +18,44 @@ const publicKeyBase64 = process.env.PUBLIC_KEY_BASE64 || DEFAULT_PUBLIC_KEY_BASE
 const v1ApiBaseUrl = process.env.V1_API_BASE_URL || DEFAULT_V1_API_BASE_URL;
 const v1ServerKey = process.env.V1_SERVER_KEY;
 const webhookCreatedAuthToken = process.env.WEBHOOK_CREATED_AUTH_TOKEN || 'your_webhook_created_auth_token';
+const mongoUri = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017';
+const mongoDbName = process.env.MONGO_DB_NAME || 'erlc_gateway';
+
+const COLLECTION_FORMATS = {
+  webhooks: {
+    description: 'Stores webhook registrations.',
+    requiredFields: {
+      webhookId: 'string',
+      robloxID: 'string',
+      username: 'string',
+      mode: 'string (poll|easy|proxy)',
+      createdAt: 'date'
+    },
+    optionalFields: {
+      webhookURL: 'string (optional when mode is poll)'
+    },
+    indexes: [
+      { fields: { webhookId: 1 }, unique: true }
+    ]
+  },
+  webhookEvents: {
+    description: 'Stores queued poll events.',
+    requiredFields: {
+      webhookId: 'string',
+      event: 'string',
+      userId: 'string',
+      timestamp: 'string|number',
+      createdAt: 'date'
+    },
+    optionalFields: {
+      server: 'object',
+      eventData: 'flattened from ERLC event.data keys'
+    },
+    indexes: [
+      { fields: { createdAt: 1 }, ttlSeconds: 600 }
+    ]
+  }
+};
 
 function verifySignature(timestamp, rawBody, signatureHex, publicKey) {
   const signature = Buffer.from(signatureHex, 'hex');
@@ -93,38 +131,33 @@ const receivedEvents = []; //debug store for received events
 
 const app = express();
 
-const client = new MongoClient("mongodb://127.0.0.1:27017"); //temp for testing
-
+const mongoClient = new MongoClient(mongoUri);
+let webhooks;
 let webhookEvents;
 
-async function start() {
-  await client.connect();
+async function connectMongo() {
+  await mongoClient.connect();
 
-  const db = client.db("erlc_gateway");
-  webhooks = db.collection("webhooks");
+  const db = mongoClient.db(mongoDbName);
+  webhooks = db.collection('webhooks');
+  webhookEvents = db.collection('webhookEvents');
 
   await webhooks.createIndex({ webhookId: 1 }, { unique: true });
+  await webhookEvents.createIndex({ createdAt: 1 }, { expireAfterSeconds: 600 });
 
-  webhookEvents = db.collection("webhookEvents");
-
-  await webhookEvents.createIndex(
-  { createdAt: 1 },
-  { expireAfterSeconds: 600 }
-    );
-
-  console.log("MongoDB connected");
+  console.log(`[MongoDB] connected to ${mongoDbName}`);
 }
-
-start();
-
-
-app.listen(port, () => {
-    console.log(`Server is running on port ${port}`);
-});
 
 app.get('/health', (_req, res) => {
     res.json({ ok: true, service: 'erlc-webhook-test-service' });
   });
+
+app.get('/meta/collections-format', (_req, res) => {
+  res.json({
+    database: mongoDbName,
+    collections: COLLECTION_FORMATS
+  });
+});
 
 
 app.get("/webhooks", async (req, res) => {
@@ -191,24 +224,35 @@ app.post('/webhook/create', express.json(), async (req, res) => {
       return res.status(400).json({ error: 'Invalid JSON body' });
     }
 
-    if (!req.body.discordID || !req.body.webhookURL || !req.body.mode) {
-      console.warn('Received /webhook/create with missing discordID or webhookURL or mode:', req.body);
-      return res.status(400).json({ error: 'Missing discordID or webhookURL or mode' });
+    const { robloxID, username, webhookURL, mode } = req.body;
+    if (!robloxID || !mode || typeof username !== 'string' || username.trim() === '') {
+      console.warn('Received /webhook/create with missing robloxID or mode or username:', req.body);
+      return res.status(400).json({ error: 'Missing robloxID or mode or username' });
+    }
+
+    const normalizedMode = String(mode).trim().toLowerCase();
+    if (!['poll', 'easy', 'proxy'].includes(normalizedMode)) {
+      return res.status(400).json({ error: 'Invalid mode. Use poll, easy, or proxy' });
+    }
+
+    if (normalizedMode !== 'poll' && !webhookURL) {
+      return res.status(400).json({ error: 'webhookURL is required for easy and proxy modes' });
     }
 
     const webhookId = generateWebhookId();
 
     await webhooks.insertOne({
       webhookId,
-      discordID: req.body.discordID,
-      webhookURL: req.body.webhookURL,
-      mode: req.body.mode,
+      robloxID,
+      username: username.trim(),
+      ...(webhookURL ? { webhookURL } : {}),
+      mode: normalizedMode,
       createdAt: new Date()
     });
 
 
 
-    console.log(`Received /webhook/create for Discord ID ${req.body.discordID}`);
+  console.log(`Received /webhook/create for Roblox ID ${robloxID}`);
     console.log('Received /webhook/create event with body:', req.body);
     res.json({
       success: true,
@@ -230,13 +274,39 @@ app.post('/webhook/create', express.json(), async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    const { webhookURL, mode, discordID } = req.body;
+    const { webhookURL, mode, robloxID, username } = req.body;
+
+    const existingWebhook = await webhooks.findOne({ webhookId: req.params.id });
+    if (!existingWebhook) {
+      return res.status(404).json({
+        error: "Webhook not found"
+      });
+    }
+
+    const nextMode = mode !== undefined
+      ? String(mode).trim().toLowerCase()
+      : existingWebhook.mode;
+
+    if (!['poll', 'easy', 'proxy'].includes(nextMode)) {
+      return res.status(400).json({ error: 'Invalid mode. Use poll, easy, or proxy' });
+    }
+
+    const nextWebhookURL = webhookURL !== undefined ? webhookURL : existingWebhook.webhookURL;
+    if (nextMode !== 'poll' && !nextWebhookURL) {
+      return res.status(400).json({ error: 'webhookURL is required for easy and proxy modes' });
+    }
 
     const update = {};
 
     if (webhookURL !== undefined) update.webhookURL = webhookURL;
-    if (mode !== undefined) update.mode = mode;
-    if (discordID !== undefined) update.discordID = discordID;
+    if (mode !== undefined) update.mode = nextMode;
+    if (robloxID !== undefined) update.robloxID = robloxID;
+    if (username !== undefined) {
+      if (typeof username !== 'string' || username.trim() === '') {
+        return res.status(400).json({ error: 'username must be a non-empty string' });
+      }
+      update.username = username.trim();
+    }
 
     if (Object.keys(update).length === 0) {
       return res.status(400).json({
@@ -245,12 +315,6 @@ app.post('/webhook/create', express.json(), async (req, res) => {
     }
 
     console.log(`Received /webhook/${req.params.id} update with body:`, req.body);
-
-    const find = await webhooks.findOne({ webhookId: req.params.id });
-
-    if (!find) {
-        console.warn(`Webhook with ID ${req.params.id} not found for update`);
-    }
 
     const result = await webhooks.findOneAndUpdate(
       { webhookId: req.params.id },
@@ -470,3 +534,17 @@ app.post('/webhook/erlc/:id', async (req, res) => {
 
     return res.sendStatus(204);
 });
+
+async function boot() {
+  try {
+    await connectMongo();
+    app.listen(port, () => {
+      console.log(`Server is running on port ${port}`);
+    });
+  } catch (err) {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  }
+}
+
+boot();
