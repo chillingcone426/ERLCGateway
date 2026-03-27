@@ -1,0 +1,158 @@
+openapi: 3.0.3
+info:
+  title: LibertyTools Public API
+  version: 1.0.0
+  description: Public, non-secured endpoints exposed by the LibertyTools gateway.
+servers:
+  - url: https://api.libertytools.dev
+    description: Production
+  - url: http://localhost:3000
+    description: Local development
+paths:
+  /health:
+    get:
+      tags: [Public]
+      summary: Health check
+      operationId: getHealth
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, service]
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+                  service:
+                    type: string
+                    example: erlc-webhook-test-service
+
+  /meta/collections-format:
+    get:
+      tags: [Public]
+      summary: Get MongoDB collection format metadata
+      operationId: getCollectionsFormat
+      responses:
+        '200':
+          description: Collection format metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [database, collections]
+                properties:
+                  database:
+                    type: string
+                    example: erlc_gateway
+                  collections:
+                    type: object
+                    description: Collection format definitions from server constants.
+                    additionalProperties: true
+
+  /webhook/{id}/events:
+    get:
+      tags: [Public]
+      summary: Poll queued events for a webhook in poll mode
+      operationId: getWebhookEvents
+      description: |
+        Returns up to 50 queued events for the webhook and then removes those returned
+        events from the queue.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          description: Webhook ID
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Events fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [count, events]
+                properties:
+                  count:
+                    type: integer
+                    minimum: 0
+                    example: 2
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PollEvent'
+        '400':
+          description: Webhook exists but is not in poll mode
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, mode]
+                properties:
+                  error:
+                    type: string
+                    example: Webhook is not in poll mode
+                  mode:
+                    type: string
+                    example: easy
+        '404':
+          description: Webhook not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    PollEvent:
+      type: object
+      description: Stored poll-mode event.
+      additionalProperties: true
+      properties:
+        _id:
+          type: string
+          description: MongoDB document ID (serialized ObjectId)
+          example: 69c1d6bc2d7df84e629e4b94
+        webhookId:
+          type: string
+          example: vW293TdjBRX4Lqha
+        event:
+          type: string
+          example: CustomCommand
+        userId:
+          type: string
+          example: '666825250'
+        timestamp:
+          type: integer
+          format: int64
+          example: 1774312424
+        command:
+          type: string
+          example: cmds
+        argument:
+          type: string
+          example: ''
+        server:
+          type: string
+          example: onwGEDGRJAgCrOURVkVJNmTSkhyyOFLOSMaFWCOQ
+        createdAt:
+          type: string
+          format: date-time
+          example: '2026-03-24T00:33:48.803Z'
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          example: Internal error
