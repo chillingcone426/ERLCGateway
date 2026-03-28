@@ -535,6 +535,14 @@ app.post('/webhook/erlc/:id', async (req, res) => {
     return res.sendStatus(204);
 });
 
+app.use((req, res) => {
+    res.status(404).json({
+        error: "ROUTE_NOT_FOUND",
+        message: `The endpoint '${req.originalUrl}' does not exist.`,
+        suggestion: "Check the API documentation for valid endpoints."
+    })
+})
+
 async function boot() {
   try {
     await connectMongo();
