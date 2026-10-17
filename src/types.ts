@@ -103,6 +103,14 @@ export interface DeliveryAttempt {
   errorCode?: string;
 }
 
+export interface DeliveryRecord extends DeliveryJob {
+  connectionId: string;
+  destinationName: string;
+  destinationType: DestinationType;
+  eventType: string;
+  attempts: DeliveryAttempt[];
+}
+
 export type RuleTrigger =
   | { type: "customCommand"; command: string }
   | { type: "event"; eventType: string };
@@ -136,6 +144,13 @@ export interface Rule {
   updatedAt: string;
 }
 
+export interface RuleRevision {
+  ruleId: string;
+  revision: number;
+  definition: RuleDefinition;
+  publishedAt: string;
+}
+
 export interface RuleExecution {
   id: string;
   ruleId: string;
@@ -144,6 +159,17 @@ export interface RuleExecution {
   detail: Record<string, unknown>;
   createdAt: string;
   completedAt?: string;
+}
+
+export interface RuleJob {
+  id: string;
+  ruleId: string;
+  eventId: string;
+  attempt: number;
+  state: "pending" | "running" | "succeeded" | "failed" | "cancelled";
+  availableAt: string;
+  createdAt: string;
+  lastErrorCode?: string;
 }
 
 export interface UsageLimits {
@@ -159,4 +185,14 @@ export interface UsageLimits {
 export interface RequestIdentity {
   accountId: string;
   requestId: string;
+}
+
+export interface AuditEntry {
+  id: string;
+  accountId: string;
+  connectionId?: string;
+  action: string;
+  requestId: string;
+  statusCode: number;
+  createdAt: string;
 }

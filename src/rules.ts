@@ -143,11 +143,19 @@ export class RuleEngine {
 
   async processEvent(event: GatewayEvent, rules?: Rule[]) {
     const matching = rules ?? await this.matchingRules(event);
-    for (const rule of matching) await this.#execute(rule, event);
+    for (const rule of matching) await this.executeRule(rule, event);
     return matching.length;
   }
 
-  async #execute(rule: Rule, event: GatewayEvent) {
+  async enqueue(event: GatewayEvent, rules?: Rule[]) {
+    const matching = rules ?? await this.matchingRules(event);
+    const now = new Date(this.#now()).toISOString();
+    for (const rule of matching) await this.#store.enqueueRuleJob({ id: randomId("rjb"), ruleId: rule.id,
+      eventId: event.id, attempt: 0, state: "pending", availableAt: now, createdAt: now });
+    return matching.length;
+  }
+
+  async executeRule(rule: Rule, event: GatewayEvent) {
     const definition = rule.published!;
     const createdAt = new Date(this.#now()).toISOString();
     const execution: RuleExecution = {
@@ -243,5 +251,52 @@ export class RuleEngine {
     } finally {
       clearTimeout(timer);
     }
+  }
+}
+
+export class RuleWorker {
+  readonly #store: GatewayStore;
+  readonly #engine: RuleEngine;
+  readonly #pollMs: number;
+  #timer: NodeJS.Timeout | undefined;
+  #running = false;
+
+  constructor(options: { store: GatewayStore; engine: RuleEngine; pollMs: number }) {
+    this.#store = options.store; this.#engine = options.engine; this.#pollMs = options.pollMs;
+  }
+
+  start() {
+    if (this.#timer) return;
+    this.#timer = setInterval(() => { void this.runOnce(); }, this.#pollMs);
+    this.#timer.unref();
+  }
+
+  stop() { if (this.#timer) clearInterval(this.#timer); this.#timer = undefined; }
+
+  async runOnce() {
+    if (this.#running) return 0;
+    this.#running = true;
+    try {
+      const jobs = await this.#store.claimRuleJobs(10, new Date().toISOString());
+      for (const job of jobs) {
+        const rule = await this.#store.getRule(job.ruleId);
+        const event = await this.#store.getEvent(job.eventId);
+        if (!rule?.enabled || !rule.published || !event) {
+          await this.#store.updateRuleJob({ ...job, state: "cancelled", lastErrorCode: "rule_or_event_inactive" });
+          continue;
+        }
+        try {
+          await this.#engine.executeRule(rule, event);
+          await this.#store.updateRuleJob({ ...job, attempt: job.attempt + 1, state: "succeeded" });
+        } catch (error) {
+          const attempt = job.attempt + 1;
+          const retry = attempt < 3;
+          await this.#store.updateRuleJob({ ...job, attempt, state: retry ? "pending" : "failed",
+            availableAt: retry ? new Date(Date.now() + attempt * 1000).toISOString() : new Date().toISOString(),
+            lastErrorCode: error instanceof Error ? error.name : "rule_execution_failed" });
+        }
+      }
+      return jobs.length;
+    } finally { this.#running = false; }
   }
 }

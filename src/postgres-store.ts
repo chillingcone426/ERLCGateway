@@ -5,15 +5,19 @@ import { encodeCursor } from "./normalization.js";
 import { eventMatchesSubscription } from "./memory-store.js";
 import type { EventQuery, GatewayStore } from "./store.js";
 import type {
+  AuditEntry,
   Connection,
   DeliveryAttempt,
   DeliveryJob,
+  DeliveryRecord,
   EventPage,
   ForwardDestination,
   GatewayEvent,
   PollSubscription,
   Rule,
-  RuleExecution
+  RuleRevision,
+  RuleExecution,
+  RuleJob
 } from "./types.js";
 
 function iso(value: unknown) { return new Date(String(value)).toISOString(); }
@@ -94,8 +98,9 @@ export class PostgresGatewayStore implements GatewayStore {
   constructor(connectionString: string) { this.pool = new Pool({ connectionString, max: 20 }); }
 
   async init() {
-    const sql = await fs.readFile(path.join(process.cwd(), "migrations", "001_initial.sql"), "utf8");
-    await this.pool.query(sql);
+    const directory = path.join(process.cwd(), "migrations");
+    const files = (await fs.readdir(directory)).filter(name => name.endsWith(".sql")).sort();
+    for (const file of files) await this.pool.query(await fs.readFile(path.join(directory, file), "utf8"));
   }
   async close() { await this.pool.end(); }
 
@@ -219,9 +224,19 @@ export class PostgresGatewayStore implements GatewayStore {
     }
     const hasMore = events.length > query.limit;
     const page = events.slice(0, query.limit);
+    let pendingCount = 0;
+    if (query.pendingForSubscriptionId) {
+      const subscription = await this.getPollSubscription(query.pendingForSubscriptionId);
+      if (subscription) {
+        const pending = await this.pool.query(`SELECT e.* FROM events e WHERE e.connection_id=$1 AND
+          NOT EXISTS (SELECT 1 FROM poll_acknowledgements a WHERE a.subscription_id=$2 AND a.event_id=e.id)`,
+          [connectionId, query.pendingForSubscriptionId]);
+        pendingCount = pending.rows.map(eventFromRow).filter(event => eventMatchesSubscription(event, subscription)).length;
+      }
+    }
     return {
       events: page, nextCursor: page.length ? encodeCursor(page[page.length - 1]!) : null, hasMore,
-      pendingCount: query.pendingForSubscriptionId ? events.length : 0
+      pendingCount
     };
   }
   async acknowledgeEvents(subscriptionId: string, eventIds: string[], acknowledgedAt: string) {
@@ -259,13 +274,34 @@ export class PostgresGatewayStore implements GatewayStore {
     });
   }
   async updateDelivery(value: DeliveryJob) {
-    await this.pool.query("UPDATE delivery_jobs SET attempt=$2,state=$3,available_at=$4,last_error_code=$5 WHERE id=$1", [
-      value.id, value.attempt, value.state, value.availableAt, value.lastErrorCode ?? null]);
+    await this.pool.query("UPDATE delivery_jobs SET attempt=$2,state=$3,available_at=$4,last_error_code=$5,created_at=$6 WHERE id=$1", [
+      value.id, value.attempt, value.state, value.availableAt, value.lastErrorCode ?? null, value.createdAt]);
   }
   async recordDeliveryAttempt(value: DeliveryAttempt) {
     await this.pool.query(`INSERT INTO delivery_attempts(id,delivery_id,attempted_at,status_code,latency_ms,result,response_excerpt,error_code)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [value.id, value.deliveryId, value.attemptedAt, value.statusCode ?? null,
       value.latencyMs, value.result, value.responseExcerpt ?? null, value.errorCode ?? null]);
+  }
+  async getDelivery(id: string): Promise<DeliveryRecord | undefined> {
+    const result = await this.pool.query(`SELECT j.*, d.connection_id, d.name destination_name, d.type destination_type,
+      e.type event_type FROM delivery_jobs j JOIN forward_destinations d ON d.id=j.destination_id
+      JOIN events e ON e.id=j.event_id WHERE j.id=$1`, [id]);
+    if (!result.rows[0]) return undefined;
+    const row = result.rows[0];
+    const attempts = await this.pool.query("SELECT * FROM delivery_attempts WHERE delivery_id=$1 ORDER BY attempted_at", [id]);
+    return { ...deliveryFromRow(row), connectionId: String(row.connection_id), destinationName: String(row.destination_name),
+      destinationType: String(row.destination_type) as DeliveryRecord["destinationType"], eventType: String(row.event_type),
+      attempts: attempts.rows.map(item => ({ id: String(item.id), deliveryId: String(item.delivery_id),
+        attemptedAt: iso(item.attempted_at), ...(item.status_code !== null ? { statusCode: Number(item.status_code) } : {}),
+        latencyMs: Number(item.latency_ms), result: String(item.result) as DeliveryAttempt["result"],
+        ...(item.response_excerpt ? { responseExcerpt: String(item.response_excerpt) } : {}),
+        ...(item.error_code ? { errorCode: String(item.error_code) } : {}) })) };
+  }
+  async listDeliveries(connectionId: string, limit: number) {
+    const result = await this.pool.query(`SELECT j.id FROM delivery_jobs j JOIN forward_destinations d ON d.id=j.destination_id
+      WHERE d.connection_id=$1 ORDER BY j.created_at DESC LIMIT $2`, [connectionId, limit]);
+    const records = await Promise.all(result.rows.map(row => this.getDelivery(String(row.id))));
+    return records.filter((value): value is DeliveryRecord => Boolean(value));
   }
 
   async createRule(value: Rule) {
@@ -289,6 +325,21 @@ export class PostgresGatewayStore implements GatewayStore {
       value.updatedAt]);
   }
   async deleteRule(id: string) { await this.pool.query("DELETE FROM rules WHERE id=$1", [id]); }
+  async createRuleRevision(value: RuleRevision) {
+    await this.pool.query(`INSERT INTO rule_revisions(rule_id,revision,definition,published_at) VALUES($1,$2,$3,$4)
+      ON CONFLICT(rule_id,revision) DO NOTHING`, [value.ruleId, value.revision, JSON.stringify(value.definition), value.publishedAt]);
+  }
+  async listRuleRevisions(ruleId: string) {
+    const result = await this.pool.query("SELECT * FROM rule_revisions WHERE rule_id=$1 ORDER BY revision DESC", [ruleId]);
+    return result.rows.map(row => ({ ruleId: String(row.rule_id), revision: Number(row.revision),
+      definition: row.definition as RuleRevision["definition"], publishedAt: iso(row.published_at) }));
+  }
+  async getRuleRevision(ruleId: string, revision: number) {
+    const result = await this.pool.query("SELECT * FROM rule_revisions WHERE rule_id=$1 AND revision=$2", [ruleId, revision]);
+    const row = result.rows[0];
+    return row ? { ruleId: String(row.rule_id), revision: Number(row.revision),
+      definition: row.definition as RuleRevision["definition"], publishedAt: iso(row.published_at) } : undefined;
+  }
   async recordRuleExecution(value: RuleExecution) {
     await this.pool.query(`INSERT INTO rule_executions(id,rule_id,event_id,status,detail,created_at,completed_at)
       VALUES($1,$2,$3,$4,$5,$6,$7)`, [value.id, value.ruleId, value.eventId, value.status,
@@ -302,6 +353,27 @@ export class PostgresGatewayStore implements GatewayStore {
       status: String(row.status) as RuleExecution["status"], detail: row.detail as Record<string, unknown>,
       createdAt: iso(row.created_at), ...(row.completed_at ? { completedAt: iso(row.completed_at) } : {})
     }));
+  }
+  async enqueueRuleJob(value: RuleJob) {
+    const result = await this.pool.query(`INSERT INTO rule_jobs(id,rule_id,event_id,attempt,state,available_at,created_at,last_error_code)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(rule_id,event_id) DO NOTHING RETURNING id`,
+      [value.id, value.ruleId, value.eventId, value.attempt, value.state, value.availableAt, value.createdAt, value.lastErrorCode ?? null]);
+    return Boolean(result.rowCount);
+  }
+  async claimRuleJobs(limit: number, now: string) {
+    return this.transaction(async client => {
+      const result = await client.query(`SELECT * FROM rule_jobs WHERE state='pending' AND available_at <= $1
+        ORDER BY available_at FOR UPDATE SKIP LOCKED LIMIT $2`, [now, limit]);
+      if (!result.rows.length) return [];
+      await client.query("UPDATE rule_jobs SET state='running' WHERE id=ANY($1::text[])", [result.rows.map(row => row.id)]);
+      return result.rows.map(row => ({ id: String(row.id), ruleId: String(row.rule_id), eventId: String(row.event_id),
+        attempt: Number(row.attempt), state: "running" as const, availableAt: iso(row.available_at), createdAt: iso(row.created_at),
+        ...(row.last_error_code ? { lastErrorCode: String(row.last_error_code) } : {}) }));
+    });
+  }
+  async updateRuleJob(value: RuleJob) {
+    await this.pool.query("UPDATE rule_jobs SET attempt=$2,state=$3,available_at=$4,last_error_code=$5 WHERE id=$1",
+      [value.id, value.attempt, value.state, value.availableAt, value.lastErrorCode ?? null]);
   }
 
   async takeRateLimit(key: string, limit: number, windowMs: number, now = Date.now()) {
@@ -344,5 +416,26 @@ export class PostgresGatewayStore implements GatewayStore {
     } finally {
       client.release();
     }
+  }
+  async recordAudit(value: AuditEntry) {
+    await this.pool.query(`INSERT INTO audit_log(id,account_id,connection_id,action,request_id,status_code,created_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7)`, [value.id, value.accountId, value.connectionId ?? null, value.action,
+      value.requestId, value.statusCode, value.createdAt]);
+  }
+  async listAudit(accountId: string, connectionId: string | undefined, limit: number) {
+    const values: unknown[] = [accountId];
+    const where = ["account_id=$1"];
+    if (connectionId) { values.push(connectionId); where.push(`connection_id=$${values.length}`); }
+    values.push(limit);
+    const result = await this.pool.query(`SELECT * FROM audit_log WHERE ${where.join(" AND ")}
+      ORDER BY created_at DESC LIMIT $${values.length}`, values);
+    return result.rows.map(row => ({ id: String(row.id), accountId: String(row.account_id),
+      ...(row.connection_id ? { connectionId: String(row.connection_id) } : {}), action: String(row.action),
+      requestId: String(row.request_id), statusCode: Number(row.status_code), createdAt: iso(row.created_at) }));
+  }
+  async cleanup(beforeEvents: string, beforeAudit: string) {
+    const events = await this.pool.query("DELETE FROM events WHERE received_at < $1", [beforeEvents]);
+    const audit = await this.pool.query("DELETE FROM audit_log WHERE created_at < $1", [beforeAudit]);
+    return { events: events.rowCount ?? 0, audit: audit.rowCount ?? 0 };
   }
 }

@@ -1,13 +1,17 @@
 import type {
+  AuditEntry,
   Connection,
   DeliveryAttempt,
   DeliveryJob,
+  DeliveryRecord,
   EventPage,
   ForwardDestination,
   GatewayEvent,
   PollSubscription,
   Rule,
-  RuleExecution
+  RuleRevision,
+  RuleExecution,
+  RuleJob
 } from "./types.js";
 
 export interface EventQuery {
@@ -53,14 +57,22 @@ export interface GatewayStore {
   claimDeliveries(limit: number, now: string): Promise<DeliveryJob[]>;
   updateDelivery(job: DeliveryJob): Promise<void>;
   recordDeliveryAttempt(attempt: DeliveryAttempt): Promise<void>;
+  getDelivery(id: string): Promise<DeliveryRecord | undefined>;
+  listDeliveries(connectionId: string, limit: number): Promise<DeliveryRecord[]>;
 
   createRule(rule: Rule): Promise<void>;
   listRules(connectionId: string): Promise<Rule[]>;
   getRule(id: string): Promise<Rule | undefined>;
   updateRule(rule: Rule): Promise<void>;
   deleteRule(id: string): Promise<void>;
+  createRuleRevision(revision: RuleRevision): Promise<void>;
+  listRuleRevisions(ruleId: string): Promise<RuleRevision[]>;
+  getRuleRevision(ruleId: string, revision: number): Promise<RuleRevision | undefined>;
   recordRuleExecution(execution: RuleExecution): Promise<void>;
   listRuleExecutions(connectionId: string): Promise<RuleExecution[]>;
+  enqueueRuleJob(job: RuleJob): Promise<boolean>;
+  claimRuleJobs(limit: number, now: string): Promise<RuleJob[]>;
+  updateRuleJob(job: RuleJob): Promise<void>;
 
   takeRateLimit(key: string, limit: number, windowMs: number, now?: number): Promise<{
     allowed: boolean;
@@ -68,4 +80,7 @@ export interface GatewayStore {
     retryAfterMs: number;
   }>;
   takeCooldown(key: string, durationMs: number, now?: number): Promise<{ allowed: boolean; retryAfterMs: number }>;
+  recordAudit(entry: AuditEntry): Promise<void>;
+  listAudit(accountId: string, connectionId: string | undefined, limit: number): Promise<AuditEntry[]>;
+  cleanup(beforeEvents: string, beforeAudit: string): Promise<{ events: number; audit: number }>;
 }

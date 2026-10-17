@@ -2,14 +2,18 @@ import { encodeCursor } from "./normalization.js";
 import { FixedWindowLimiter } from "./limits.js";
 import type { EventQuery, GatewayStore } from "./store.js";
 import type {
+  AuditEntry,
   Connection,
   DeliveryAttempt,
   DeliveryJob,
+  DeliveryRecord,
   ForwardDestination,
   GatewayEvent,
   PollSubscription,
   Rule,
-  RuleExecution
+  RuleRevision,
+  RuleExecution,
+  RuleJob
 } from "./types.js";
 
 function eventMatchesSubscription(event: GatewayEvent, subscription: PollSubscription) {
@@ -32,9 +36,12 @@ export class MemoryGatewayStore implements GatewayStore {
   readonly deliveries = new Map<string, DeliveryJob>();
   readonly deliveryAttempts: DeliveryAttempt[] = [];
   readonly rules = new Map<string, Rule>();
+  readonly ruleRevisions = new Map<string, RuleRevision>();
   readonly ruleExecutions: RuleExecution[] = [];
+  readonly ruleJobs = new Map<string, RuleJob>();
   readonly limiter = new FixedWindowLimiter();
   readonly cooldowns = new Map<string, number>();
+  readonly auditEntries: AuditEntry[] = [];
 
   async init() {}
   async close() {}
@@ -149,6 +156,25 @@ export class MemoryGatewayStore implements GatewayStore {
   }
   async updateDelivery(job: DeliveryJob) { this.deliveries.set(job.id, job); }
   async recordDeliveryAttempt(attempt: DeliveryAttempt) { this.deliveryAttempts.push(attempt); }
+  async getDelivery(id: string): Promise<DeliveryRecord | undefined> {
+    const job = this.deliveries.get(id);
+    if (!job) return undefined;
+    const destination = this.destinations.get(job.destinationId);
+    const event = this.events.get(job.eventId);
+    if (!destination || !event) return undefined;
+    return { ...job, connectionId: destination.connectionId, destinationName: destination.name,
+      destinationType: destination.type, eventType: event.type,
+      attempts: this.deliveryAttempts.filter(value => value.deliveryId === id) };
+  }
+  async listDeliveries(connectionId: string, limit: number) {
+    const values: DeliveryRecord[] = [];
+    for (const job of [...this.deliveries.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt))) {
+      const record = await this.getDelivery(job.id);
+      if (record?.connectionId === connectionId) values.push(record);
+      if (values.length >= limit) break;
+    }
+    return values;
+  }
 
   async createRule(rule: Rule) { this.rules.set(rule.id, rule); }
   async listRules(connectionId: string) {
@@ -157,11 +183,27 @@ export class MemoryGatewayStore implements GatewayStore {
   async getRule(id: string) { return this.rules.get(id); }
   async updateRule(rule: Rule) { this.rules.set(rule.id, rule); }
   async deleteRule(id: string) { this.rules.delete(id); }
+  async createRuleRevision(revision: RuleRevision) { this.ruleRevisions.set(`${revision.ruleId}:${revision.revision}`, revision); }
+  async listRuleRevisions(ruleId: string) {
+    return [...this.ruleRevisions.values()].filter(value => value.ruleId === ruleId).sort((a, b) => b.revision - a.revision);
+  }
+  async getRuleRevision(ruleId: string, revision: number) { return this.ruleRevisions.get(`${ruleId}:${revision}`); }
   async recordRuleExecution(execution: RuleExecution) { this.ruleExecutions.push(execution); }
   async listRuleExecutions(connectionId: string) {
     const ruleIds = new Set((await this.listRules(connectionId)).map(rule => rule.id));
     return this.ruleExecutions.filter(value => ruleIds.has(value.ruleId));
   }
+  async enqueueRuleJob(job: RuleJob) {
+    if ([...this.ruleJobs.values()].some(value => value.ruleId === job.ruleId && value.eventId === job.eventId)) return false;
+    this.ruleJobs.set(job.id, job); return true;
+  }
+  async claimRuleJobs(limit: number, now: string) {
+    const jobs = [...this.ruleJobs.values()].filter(value => value.state === "pending" && value.availableAt <= now)
+      .sort((a, b) => a.availableAt.localeCompare(b.availableAt)).slice(0, limit);
+    for (const job of jobs) this.ruleJobs.set(job.id, { ...job, state: "running" });
+    return jobs.map(job => ({ ...job, state: "running" as const }));
+  }
+  async updateRuleJob(job: RuleJob) { this.ruleJobs.set(job.id, job); }
 
   async takeRateLimit(key: string, limit: number, windowMs: number, now?: number) {
     return this.limiter.take(key, limit, windowMs, now);
@@ -171,6 +213,18 @@ export class MemoryGatewayStore implements GatewayStore {
     if (availableAt > now) return { allowed: false, retryAfterMs: availableAt - now };
     this.cooldowns.set(key, now + durationMs);
     return { allowed: true, retryAfterMs: 0 };
+  }
+  async recordAudit(entry: AuditEntry) { this.auditEntries.push(entry); }
+  async listAudit(accountId: string, connectionId: string | undefined, limit: number) {
+    return this.auditEntries.filter(value => value.accountId === accountId && (!connectionId || value.connectionId === connectionId))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit);
+  }
+  async cleanup(beforeEvents: string, beforeAudit: string) {
+    let events = 0;
+    for (const [id, event] of this.events) if (event.receivedAt < beforeEvents) { this.events.delete(id); this.eventByDedupe.delete(event.dedupeKey); events += 1; }
+    const before = this.auditEntries.length;
+    for (let index = this.auditEntries.length - 1; index >= 0; index -= 1) if (this.auditEntries[index]!.createdAt < beforeAudit) this.auditEntries.splice(index, 1);
+    return { events, audit: before - this.auditEntries.length };
   }
 }
 

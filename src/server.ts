@@ -4,7 +4,8 @@ import type { GatewayConfig } from "./config.js";
 import { enqueueEventDeliveries, ForwardingWorker } from "./forwarding.js";
 import { DEFAULT_LIMITS, RUNTIME_LIMITS } from "./limits.js";
 import { decodeCursor, normalizeWebhookEvent } from "./normalization.js";
-import { RuleEngine, normalizeCommand, validateRuleDefinition } from "./rules.js";
+import { MaintenanceWorker } from "./maintenance.js";
+import { RuleEngine, RuleWorker, normalizeCommand, validateRuleDefinition } from "./rules.js";
 import {
   constantTimeEqual,
   createToken,
@@ -23,7 +24,9 @@ interface CreateAppOptions {
   store: GatewayStore;
   worker?: ForwardingWorker;
   ruleEngine?: RuleEngine;
+  ruleWorker?: RuleWorker;
   fetch?: typeof globalThis.fetch;
+  maintenanceWorker?: MaintenanceWorker;
   logger?: boolean;
 }
 
@@ -77,12 +80,12 @@ function destinationFilter(value: unknown): DestinationFilter {
   };
 }
 
-function connectionJson(value: Connection, outputs?: { poll: number; destinations: ForwardDestination[]; rules: number }) {
+function connectionJson(value: Connection, baseUrl: string, outputs?: { poll: number; destinations: ForwardDestination[]; rules: number }) {
   return {
     id: value.id,
     name: value.name,
     publicId: value.publicId,
-    ingestUrl: value.publicId,
+    ingestUrl: `${baseUrl}/v1/ingest/${value.publicId}`,
     paused: value.paused,
     ...(value.legacyPreset ? { legacyPreset: value.legacyPreset } : {}),
     ...(value.serverId ? { server: { id: value.serverId, ...(value.serverName ? { name: value.serverName } : {}) } } : {}),
@@ -135,9 +138,12 @@ export async function createApp(options: CreateAppOptions) {
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: RUNTIME_LIMITS.maxInboundBytes });
   const worker = options.worker ?? new ForwardingWorker({ store, config });
   const ruleEngine = options.ruleEngine ?? new RuleEngine({ store, config, ...(options.fetch ? { fetch: options.fetch } : {}) });
+  const ruleWorker = options.ruleWorker ?? new RuleWorker({ store, engine: ruleEngine, pollMs: config.workerPollMs });
+  const maintenanceWorker = options.maintenanceWorker ?? new MaintenanceWorker({ store, config });
   const fetcher = options.fetch ?? globalThis.fetch;
 
-  await app.register(rawBody, { field: "rawBody", global: false, encoding: false, routes: ["/v1/ingest/:publicId"] });
+  await app.register(rawBody, { field: "rawBody", global: false, encoding: false,
+    routes: ["/v1/ingest/:publicId", "/webhook/:publicId", "/webhook/erlc/:publicId"] });
 
   app.setErrorHandler((error, request, reply) => {
     const api = error instanceof ApiError ? error : undefined;
@@ -155,6 +161,19 @@ export async function createApp(options: CreateAppOptions) {
     accountId(request);
   });
 
+  app.addHook("onResponse", async (request, reply) => {
+    if (!request.url.startsWith("/v1/management/") || ["GET", "HEAD", "OPTIONS"].includes(request.method) || reply.statusCode >= 500) return;
+    const owner = request.headers["x-liberty-account-id"];
+    if (typeof owner !== "string" || !owner.trim()) return;
+    const params = request.params && typeof request.params === "object" ? request.params as Record<string, unknown> : {};
+    try {
+      await store.recordAudit({ id: randomId("aud"), accountId: owner.trim(),
+        ...(typeof params.id === "string" ? { connectionId: params.id } : {}),
+        action: `${request.method} ${request.routeOptions.url}`, requestId: request.id,
+        statusCode: reply.statusCode, createdAt: new Date().toISOString() });
+    } catch (error) { request.log.error({ err: error }, "audit write failed"); }
+  });
+
   app.get("/health/live", async () => ({ status: "ok", service: "libertytools-gateway" }));
   app.get("/health/ready", async (_request, reply) => {
     try {
@@ -168,12 +187,19 @@ export async function createApp(options: CreateAppOptions) {
   app.get("/v1/management/connections", async request => {
     const owner = accountId(request);
     const connections = await store.listConnections(owner);
-    const shaped = await Promise.all(connections.map(async connection => connectionJson(connection, {
+    const shaped = await Promise.all(connections.map(async connection => connectionJson(connection, config.baseUrl, {
       poll: (await store.listPollSubscriptions(connection.id)).length,
       destinations: await store.listDestinations(connection.id),
       rules: (await store.listRules(connection.id)).filter(rule => rule.enabled).length
     })));
     return { connections: shaped, usage: { connections: shaped.length }, limits: DEFAULT_LIMITS };
+  });
+
+  app.get<{ Querystring: { connectionId?: string; limit?: string } }>("/v1/management/audit", async request => {
+    const owner = accountId(request);
+    if (request.query.connectionId) await ownedConnection(store, request.query.connectionId, owner);
+    const limit = Math.min(Math.max(Number(request.query.limit ?? 100), 1), 200);
+    return { entries: await store.listAudit(owner, request.query.connectionId, limit) };
   });
 
   app.post("/v1/management/connections", async (request, reply) => {
@@ -192,12 +218,12 @@ export async function createApp(options: CreateAppOptions) {
       ...(["poll", "proxy", "easy"].includes(String(input.mode)) ? { legacyPreset: String(input.mode) as NonNullable<Connection["legacyPreset"]> } : {})
     };
     await store.createConnection(connection);
-    return reply.code(201).send({ connection: { ...connectionJson(connection), ingestUrl: `${config.baseUrl}/v1/ingest/${connection.publicId}` }, limits: DEFAULT_LIMITS });
+    return reply.code(201).send({ connection: connectionJson(connection, config.baseUrl), limits: DEFAULT_LIMITS });
   });
 
   app.get<{ Params: { id: string } }>("/v1/management/connections/:id", async request => {
     const connection = await ownedConnection(store, request.params.id, accountId(request));
-    return { connection: connectionJson(connection, {
+    return { connection: connectionJson(connection, config.baseUrl, {
       poll: (await store.listPollSubscriptions(connection.id)).length,
       destinations: await store.listDestinations(connection.id),
       rules: (await store.listRules(connection.id)).filter(rule => rule.enabled).length
@@ -214,7 +240,7 @@ export async function createApp(options: CreateAppOptions) {
       updatedAt: new Date().toISOString()
     };
     await store.updateConnection(updated);
-    return { connection: connectionJson(updated) };
+    return { connection: connectionJson(updated, config.baseUrl) };
   });
 
   app.delete<{ Params: { id: string } }>("/v1/management/connections/:id", async (request, reply) => {
@@ -239,7 +265,7 @@ export async function createApp(options: CreateAppOptions) {
       updatedAt: new Date().toISOString()
     };
     await store.updateConnection(updated);
-    return { connection: connectionJson(updated) };
+    return { connection: connectionJson(updated, config.baseUrl) };
   });
 
   app.delete<{ Params: { id: string } }>("/v1/management/connections/:id/server-credential", async request => {
@@ -247,7 +273,7 @@ export async function createApp(options: CreateAppOptions) {
     const { encryptedServerKey: _encrypted, serverKeyFingerprint: _fingerprint, ...rest } = connection;
     const updated: Connection = { ...rest, updatedAt: new Date().toISOString() };
     await store.updateConnection(updated);
-    return { connection: connectionJson(updated) };
+    return { connection: connectionJson(updated, config.baseUrl) };
   });
 
   app.get<{ Params: { id: string } }>("/v1/management/connections/:id/poll-subscriptions", async request => {
@@ -397,6 +423,45 @@ export async function createApp(options: CreateAppOptions) {
     return { destination: destinationJson(updated) };
   });
 
+  app.post<{ Params: { id: string; destinationId: string } }>("/v1/management/connections/:id/destinations/:destinationId/rotate-secret", async request => {
+    const connection = await ownedConnection(store, request.params.id, accountId(request));
+    const destination = await store.getDestination(request.params.destinationId);
+    if (!destination || destination.connectionId !== connection.id) throw new ApiError(404, "destination_not_found", "Destination not found.");
+    if (destination.type !== "signedProxy") throw new ApiError(409, "validation_failed", "Only signed Proxy destinations have signing secrets.");
+    const credential = createToken("lts");
+    const updated = { ...destination, encryptedSecret: encryptSecret(credential.token, config.encryptionKey),
+      secretPrefix: credential.prefix, updatedAt: new Date().toISOString() };
+    await store.updateDestination(updated);
+    return { destination: destinationJson(updated), signingSecret: credential.token };
+  });
+
+  app.get<{ Params: { id: string }; Querystring: { limit?: string } }>("/v1/management/connections/:id/deliveries", async request => {
+    const connection = await ownedConnection(store, request.params.id, accountId(request));
+    const limit = Math.min(Math.max(Number(request.query.limit ?? 50), 1), 100);
+    return { deliveries: await store.listDeliveries(connection.id, limit) };
+  });
+
+  app.get<{ Params: { id: string; deliveryId: string } }>("/v1/management/connections/:id/deliveries/:deliveryId", async request => {
+    const connection = await ownedConnection(store, request.params.id, accountId(request));
+    const delivery = await store.getDelivery(request.params.deliveryId);
+    if (!delivery || delivery.connectionId !== connection.id) throw new ApiError(404, "delivery_not_found", "Delivery not found.");
+    return { delivery };
+  });
+
+  app.post<{ Params: { id: string; deliveryId: string } }>("/v1/management/connections/:id/deliveries/:deliveryId/replay", async request => {
+    const owner = accountId(request);
+    const connection = await ownedConnection(store, request.params.id, owner);
+    const delivery = await store.getDelivery(request.params.deliveryId);
+    if (!delivery || delivery.connectionId !== connection.id) throw new ApiError(404, "delivery_not_found", "Delivery not found.");
+    if (delivery.state === "pending" || delivery.state === "running") throw new ApiError(409, "delivery_in_progress", "Delivery is already in progress.");
+    const rate = await store.takeRateLimit(`delivery-replay:${owner}`, 20, 60 * 60_000);
+    if (!rate.allowed) throw new ApiError(429, "rate_limited", "Delivery replay limit reached.", { retryAfterSeconds: Math.ceil(rate.retryAfterMs / 1000) });
+    const now = new Date().toISOString();
+    await store.updateDelivery({ id: delivery.id, destinationId: delivery.destinationId, eventId: delivery.eventId,
+      attempt: 0, state: "pending", availableAt: now, createdAt: now });
+    return { replayed: true, deliveryId: delivery.id };
+  });
+
   app.get<{ Params: { id: string }; Querystring: { cursor?: string; limit?: string; type?: string; includeRaw?: string } }>("/v1/management/connections/:id/events", async request => {
     const connection = await ownedConnection(store, request.params.id, accountId(request));
     const limit = Math.min(Math.max(Number(request.query.limit ?? 50), 1), 100);
@@ -418,7 +483,7 @@ export async function createApp(options: CreateAppOptions) {
     const matchingRules = await ruleEngine.matchingRules(saved.event);
     if (input.dryRun !== true) {
       await enqueueEventDeliveries(store, saved.event, matchingRules.length > 0);
-      setImmediate(() => { void ruleEngine.processEvent(saved.event, matchingRules); });
+      await ruleEngine.enqueue(saved.event, matchingRules);
     }
     return reply.code(202).send({ accepted: true, event: eventJson(saved.event), dryRun: input.dryRun === true });
   });
@@ -427,6 +492,13 @@ export async function createApp(options: CreateAppOptions) {
     const connection = await ownedConnection(store, request.params.id, accountId(request));
     const rules = await store.listRules(connection.id);
     return { rules, usage: rules.length, limit: DEFAULT_LIMITS.rulesPerConnection };
+  });
+
+  app.get<{ Params: { id: string; ruleId: string } }>("/v1/management/connections/:id/rules/:ruleId", async request => {
+    const connection = await ownedConnection(store, request.params.id, accountId(request));
+    const rule = await store.getRule(request.params.ruleId);
+    if (!rule || rule.connectionId !== connection.id) throw new ApiError(404, "rule_not_found", "Rule not found.");
+    return { rule, revisions: await store.listRuleRevisions(rule.id) };
   });
 
   app.post<{ Params: { id: string } }>("/v1/management/connections/:id/rules", async (request, reply) => {
@@ -480,6 +552,23 @@ export async function createApp(options: CreateAppOptions) {
     const updated: Rule = { ...rule, enabled: true, activeRevision: (rule.activeRevision ?? 0) + 1,
       published: rule.draft, updatedAt: new Date().toISOString() };
     await store.updateRule(updated);
+    await store.createRuleRevision({ ruleId: rule.id, revision: updated.activeRevision!, definition: rule.draft, publishedAt: updated.updatedAt });
+    return { rule: updated };
+  });
+
+  app.post<{ Params: { id: string; ruleId: string; revision: string } }>("/v1/management/connections/:id/rules/:ruleId/revisions/:revision/rollback", async request => {
+    const connection = await ownedConnection(store, request.params.id, accountId(request));
+    const rule = await store.getRule(request.params.ruleId);
+    if (!rule || rule.connectionId !== connection.id) throw new ApiError(404, "rule_not_found", "Rule not found.");
+    if (!connection.encryptedServerKey) throw new ApiError(409, "credential_invalid", "Connect an ER:LC server key before publishing hosted actions.");
+    const revision = await store.getRuleRevision(rule.id, Number(request.params.revision));
+    if (!revision) throw new ApiError(404, "revision_not_found", "Rule revision not found.");
+    const now = new Date().toISOString();
+    const nextRevision = (rule.activeRevision ?? 0) + 1;
+    const updated: Rule = { ...rule, enabled: true, draft: revision.definition, draftVersion: rule.draftVersion + 1,
+      activeRevision: nextRevision, published: revision.definition, updatedAt: now };
+    await store.updateRule(updated);
+    await store.createRuleRevision({ ruleId: rule.id, revision: nextRevision, definition: revision.definition, publishedAt: now });
     return { rule: updated };
   });
 
@@ -490,6 +579,14 @@ export async function createApp(options: CreateAppOptions) {
     const updated = { ...rule, enabled: false, updatedAt: new Date().toISOString() };
     await store.updateRule(updated);
     return { rule: updated };
+  });
+
+  app.delete<{ Params: { id: string; ruleId: string } }>("/v1/management/connections/:id/rules/:ruleId", async (request, reply) => {
+    const connection = await ownedConnection(store, request.params.id, accountId(request));
+    const rule = await store.getRule(request.params.ruleId);
+    if (!rule || rule.connectionId !== connection.id) throw new ApiError(404, "rule_not_found", "Rule not found.");
+    await store.deleteRule(rule.id);
+    return reply.code(204).send();
   });
 
   app.get<{ Params: { id: string } }>("/v1/management/connections/:id/rule-executions", async request => {
@@ -525,7 +622,7 @@ export async function createApp(options: CreateAppOptions) {
     return await store.acknowledgeEvents(subscription.id, eventIds, new Date().toISOString());
   });
 
-  app.post<{ Params: { publicId: string } }>("/v1/ingest/:publicId", async (request, reply) => {
+  const ingestHandler = async (request: FastifyRequest<{ Params: { publicId: string } }>, reply: FastifyReply) => {
     const connection = await store.getConnectionByPublicId(request.params.publicId);
     if (!connection || connection.paused) throw new ApiError(404, "connection_not_found", "Connection not found.");
     const limit = await store.takeRateLimit(`ingest:${connection.id}`, RUNTIME_LIMITS.ingestPerMinute, 60_000);
@@ -537,6 +634,11 @@ export async function createApp(options: CreateAppOptions) {
       rawBody: raw, timestamp, signature, publicKeySpkiBase64: config.erlcPublicKeySpkiBase64,
       maxClockSkewSeconds: config.webhookMaxClockSkewSeconds
     })) {
+      const invalid = await store.takeRateLimit(`invalid-signature:${request.ip}:${connection.publicId}`,
+        RUNTIME_LIMITS.invalidSignaturesPerTenMinutes, 10 * 60_000);
+      if (!invalid.allowed) throw new ApiError(429, "rate_limited", "Too many invalid webhook signatures.", {
+        retryAfterSeconds: Math.ceil(invalid.retryAfterMs / 1000)
+      });
       throw new ApiError(401, "signature_invalid", "Webhook signature is invalid.");
     }
     const headers = Object.fromEntries(Object.entries(request.headers)
@@ -547,11 +649,31 @@ export async function createApp(options: CreateAppOptions) {
     if (saved.inserted) {
       const matchingRules = await ruleEngine.matchingRules(saved.event);
       await enqueueEventDeliveries(store, saved.event, matchingRules.length > 0);
-      setImmediate(() => { void ruleEngine.processEvent(saved.event, matchingRules); });
+      await ruleEngine.enqueue(saved.event, matchingRules);
     }
     return reply.code(202).send({ accepted: true, eventId: saved.event.id, duplicate: !saved.inserted });
+  };
+  app.post<{ Params: { publicId: string } }>("/v1/ingest/:publicId", ingestHandler);
+  app.post<{ Params: { publicId: string } }>("/webhook/:publicId", ingestHandler);
+  app.post<{ Params: { publicId: string } }>("/webhook/erlc/:publicId", ingestHandler);
+
+  app.get<{ Params: { publicId: string } }>("/webhook/:publicId", async request => {
+    const connection = await store.getConnectionByPublicId(request.params.publicId);
+    if (!connection || connection.paused) throw new ApiError(404, "connection_not_found", "Connection not found.");
+    return { ok: true, mode: connection.legacyPreset ?? "poll", webhookId: connection.publicId };
   });
 
-  app.addHook("onClose", async () => { worker.stop(); await store.close(); });
-  return { app, worker, ruleEngine };
+  app.get<{ Params: { publicId: string }; Querystring: { limit?: string } }>("/webhook/:publicId/events", async request => {
+    const connection = await store.getConnectionByPublicId(request.params.publicId);
+    if (!connection || connection.paused) throw new ApiError(404, "connection_not_found", "Connection not found.");
+    const subscription = (await store.listPollSubscriptions(connection.id))[0];
+    if (!subscription) return { count: 0, events: [] };
+    const limit = Math.min(Math.max(Number(request.query.limit ?? 50), 1), 100);
+    const page = await store.listEvents(connection.id, { limit, pendingForSubscriptionId: subscription.id });
+    if (page.events.length) await store.acknowledgeEvents(subscription.id, page.events.map(event => event.id), new Date().toISOString());
+    return { count: page.events.length, events: page.events.map(event => eventJson(event)), hasMore: page.hasMore };
+  });
+
+  app.addHook("onClose", async () => { worker.stop(); ruleWorker.stop(); maintenanceWorker.stop(); await store.close(); });
+  return { app, worker, ruleEngine, ruleWorker, maintenanceWorker };
 }

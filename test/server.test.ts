@@ -12,7 +12,7 @@ function setup() {
     managementApiToken: "management-test", erlcPublicKeySpkiBase64: publicKey.export({ format: "der", type: "spki" }).toString("base64"),
     webhookMaxClockSkewSeconds: 300, encryptionKey: crypto.randomBytes(32), forwardTimeoutMs: 1000,
     forwardMaxAttempts: 5, forwardRetryWindowMs: 900_000, workerPollMs: 100,
-    erlcApiBaseUrl: "https://api.erlc.test/v2"
+    erlcApiBaseUrl: "https://api.erlc.test/v2", eventRetentionDays: 14, auditRetentionDays: 90, maintenanceIntervalMs: 3_600_000
   };
   const store = new MemoryGatewayStore();
   const managementHeaders = { authorization: "Bearer management-test", "x-liberty-account-id": "acct_a" };
@@ -95,6 +95,20 @@ test("rejects invalid webhook signatures without storing an event", async () => 
   await app.close();
 });
 
+test("rate limits repeated invalid signatures by source and public connection", async () => {
+  const value = setup();
+  const { app } = await createApp({ config: value.config, store: value.store });
+  const connection = await createConnection(app, value.managementHeaders);
+  for (let index = 0; index < 20; index += 1) {
+    await value.store.takeRateLimit(`invalid-signature:127.0.0.1:${connection.publicId}`, 20, 600_000);
+  }
+  const response = await app.inject({ method: "POST", url: `/v1/ingest/${connection.publicId}`,
+    headers: { "content-type": "application/json", "x-signature-timestamp": String(Math.floor(Date.now() / 1000)), "x-signature-ed25519": "00" },
+    payload: JSON.stringify({ event: "WebhookProbe" }) });
+  assert.equal(response.statusCode, 429, response.body);
+  await app.close();
+});
+
 test("creates bounded HTTP destinations and rejects internal targets", async () => {
   const value = setup();
   const { app } = await createApp({ config: value.config, store: value.store });
@@ -144,3 +158,129 @@ test("rule builder dry-runs and publishes only after a server credential is conf
   assert.equal(published.json().rule.enabled, true);
   await app.close();
 });
+
+test("management responses expose stable ingest URLs and delivery replay history", async () => {
+  const value = setup();
+  const { app } = await createApp({ config: value.config, store: value.store });
+  const connection = await createConnection(app, value.managementHeaders);
+  const listed = await app.inject({ method: "GET", url: "/v1/management/connections", headers: value.managementHeaders });
+  assert.equal(listed.json().connections[0].ingestUrl, `https://api.libertytools.test/v1/ingest/${connection.publicId}`);
+  const created = await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/destinations`,
+    headers: value.managementHeaders, payload: { name: "Proxy", type: "signedProxy", url: "https://8.8.8.8/events" } });
+  const destination = created.json().destination as { id: string; secretPrefix: string };
+  const rotated = await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/destinations/${destination.id}/rotate-secret`, headers: value.managementHeaders });
+  assert.equal(rotated.statusCode, 200, rotated.body);
+  assert.notEqual(rotated.json().destination.secretPrefix, destination.secretPrefix);
+  assert.match(rotated.json().signingSecret, /^lts_/);
+
+  const now = new Date().toISOString();
+  const event = normalizeTestEvent(connection.id, now);
+  await value.store.saveEvent(event);
+  await value.store.enqueueDelivery({ id: "del_test", destinationId: destination.id, eventId: event.id,
+    attempt: 2, state: "failed", availableAt: now, createdAt: now, lastErrorCode: "http_500" });
+  await value.store.recordDeliveryAttempt({ id: "att_test", deliveryId: "del_test", attemptedAt: now,
+    statusCode: 500, latencyMs: 12, result: "failed", errorCode: "http_500" });
+  const history = await app.inject({ method: "GET", url: `/v1/management/connections/${connection.id}/deliveries`, headers: value.managementHeaders });
+  assert.equal(history.json().deliveries[0].attempts[0].statusCode, 500);
+  const replay = await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/deliveries/del_test/replay`, headers: value.managementHeaders });
+  assert.equal(replay.statusCode, 200, replay.body);
+  assert.equal(value.store.deliveries.get("del_test")?.state, "pending");
+  assert.equal(value.store.deliveries.get("del_test")?.attempt, 0);
+  await app.close();
+});
+
+test("published rule revisions can be inspected and rolled back", async () => {
+  const value = setup();
+  const fetchMock: typeof fetch = async input => String(input).endsWith("/server")
+    ? new Response(JSON.stringify({ Id: "server-1", Name: "Main" }), { status: 200 })
+    : new Response(JSON.stringify({ message: "Success" }), { status: 200 });
+  const { app } = await createApp({ config: value.config, store: value.store, fetch: fetchMock });
+  const connection = await createConnection(app, value.managementHeaders);
+  await app.inject({ method: "PUT", url: `/v1/management/connections/${connection.id}/server-credential`, headers: value.managementHeaders, payload: { serverKey: "server-key" } });
+  const firstDefinition = { trigger: { type: "customCommand", command: ";help" }, conditions: [], actions: [{ type: "privateReply", message: "First" }] };
+  const created = await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/rules`, headers: value.managementHeaders,
+    payload: { name: "Help", draft: firstDefinition } });
+  const rule = created.json().rule as { id: string; draftVersion: number };
+  await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/rules/${rule.id}/publish`, headers: value.managementHeaders, payload: { draftVersion: 1 } });
+  const secondDefinition = { ...firstDefinition, actions: [{ type: "privateReply", message: "Second" }] };
+  await app.inject({ method: "PUT", url: `/v1/management/connections/${connection.id}/rules/${rule.id}/draft`, headers: value.managementHeaders,
+    payload: { draftVersion: 1, draft: secondDefinition } });
+  await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/rules/${rule.id}/publish`, headers: value.managementHeaders, payload: { draftVersion: 2 } });
+  const detail = await app.inject({ method: "GET", url: `/v1/management/connections/${connection.id}/rules/${rule.id}`, headers: value.managementHeaders });
+  assert.deepEqual(detail.json().revisions.map((item: { revision: number }) => item.revision), [2, 1]);
+  const rollback = await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/rules/${rule.id}/revisions/1/rollback`, headers: value.managementHeaders });
+  assert.equal(rollback.json().rule.activeRevision, 3);
+  assert.equal(rollback.json().rule.published.actions[0].message, "First");
+  await app.close();
+});
+
+test("signed ingestion persists hosted-command jobs before a worker executes them", async () => {
+  const value = setup();
+  const commands: string[] = [];
+  const fetchMock: typeof fetch = async (input, init) => {
+    if (String(input).endsWith("/server") && init?.method !== "POST") return new Response(JSON.stringify({ Id: "server-1", Name: "Main" }), { status: 200 });
+    if (String(input).endsWith("/server/command")) commands.push(String(JSON.parse(String(init?.body)).command));
+    return new Response(JSON.stringify({ message: "Success" }), { status: 200 });
+  };
+  const { app, ruleWorker } = await createApp({ config: value.config, store: value.store, fetch: fetchMock });
+  const connection = await createConnection(app, value.managementHeaders);
+  await app.inject({ method: "PUT", url: `/v1/management/connections/${connection.id}/server-credential`, headers: value.managementHeaders, payload: { serverKey: "server-key" } });
+  const created = await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/rules`, headers: value.managementHeaders,
+    payload: { name: "Help", draft: { trigger: { type: "customCommand", command: ";help" }, conditions: [], actions: [{ type: "privateReply", message: "Hi {{player.username}}" }], cooldown: { durationMs: 2000, scope: "player" } } } });
+  const rule = created.json().rule as { id: string; draftVersion: number };
+  await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/rules/${rule.id}/publish`, headers: value.managementHeaders, payload: { draftVersion: 1 } });
+  const payload = JSON.stringify({ event: "CustomCommand", command: "help", username: "TestPlayer", userId: "42", serverId: "server-1" });
+  const ingest = await app.inject({ method: "POST", url: `/v1/ingest/${connection.publicId}`, headers: value.sign(payload), payload });
+  assert.equal(ingest.statusCode, 202, ingest.body);
+  assert.equal([...value.store.ruleJobs.values()][0]?.state, "pending");
+  await ruleWorker.runOnce();
+  assert.equal([...value.store.ruleJobs.values()][0]?.state, "succeeded");
+  assert.deepEqual(commands, [":pm TestPlayer Hi TestPlayer"]);
+  assert.equal(value.store.ruleExecutions[0]?.status, "succeeded");
+  await app.close();
+});
+
+test("legacy ingest and Poll paths adapt to a v2-backed connection", async () => {
+  const value = setup();
+  const { app } = await createApp({ config: value.config, store: value.store });
+  const connection = await createConnection(app, value.managementHeaders);
+  await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/poll-subscriptions`,
+    headers: value.managementHeaders, payload: { name: "Legacy LibertyJS" } });
+  const payload = JSON.stringify({ event: "CustomCommand", command: "help", userId: "42" });
+  const ingest = await app.inject({ method: "POST", url: `/webhook/erlc/${connection.publicId}`, headers: value.sign(payload), payload });
+  assert.equal(ingest.statusCode, 202, ingest.body);
+  const first = await app.inject({ method: "GET", url: `/webhook/${connection.publicId}/events` });
+  assert.equal(first.json().events.length, 1);
+  const second = await app.inject({ method: "GET", url: `/webhook/${connection.publicId}/events` });
+  assert.equal(second.json().events.length, 0);
+  await app.close();
+});
+
+test("audits management mutations without request secrets and removes expired records", async () => {
+  const value = setup();
+  const { app, maintenanceWorker } = await createApp({ config: value.config, store: value.store });
+  const connection = await createConnection(app, value.managementHeaders);
+  const audit = await app.inject({ method: "GET", url: `/v1/management/audit?connectionId=${connection.id}`, headers: value.managementHeaders });
+  assert.equal(audit.statusCode, 200, audit.body);
+  assert.ok(value.store.auditEntries.some(entry => entry.action === "POST /v1/management/connections"));
+  assert.equal(JSON.stringify(value.store.auditEntries).includes("management-test"), false);
+  const old = "2020-01-01T00:00:00.000Z";
+  const event = normalizeTestEvent(connection.id, old);
+  event.id = "evt_old"; event.dedupeKey = "old-event";
+  await value.store.saveEvent(event);
+  await value.store.recordAudit({ id: "aud_old", accountId: "acct_a", connectionId: connection.id,
+    action: "test", requestId: "req_old", statusCode: 200, createdAt: old });
+  const removed = await maintenanceWorker.runOnce();
+  assert.equal(removed.events, 1);
+  assert.equal(removed.audit, 1);
+  await app.close();
+});
+
+function normalizeTestEvent(connectionId: string, now: string) {
+  const payload = { event: "CustomCommand", command: "help", userId: "1" };
+  const rawBody = Buffer.from(JSON.stringify(payload));
+  return {
+    id: "evt_test", connectionId, type: "CustomCommand", occurredAt: now, receivedAt: now,
+    data: { command: "help", userId: "1" }, rawBody, originalHeaders: {}, synthetic: true, dedupeKey: "test-event"
+  };
+}

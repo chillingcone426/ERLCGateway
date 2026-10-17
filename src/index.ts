@@ -6,8 +6,10 @@ const config = loadConfig();
 if (!config.databaseUrl) throw new Error("DATABASE_URL is required");
 const store = new PostgresGatewayStore(config.databaseUrl);
 await store.init();
-const { app, worker } = await createApp({ config, store, logger: true });
+const { app, worker, ruleWorker, maintenanceWorker } = await createApp({ config, store, logger: true });
 worker.start();
+ruleWorker.start();
+maintenanceWorker.start();
 
 try {
   await app.listen({ host: config.host, port: config.port });

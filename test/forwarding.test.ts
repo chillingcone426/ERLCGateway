@@ -14,7 +14,7 @@ function fixture() {
     host: "127.0.0.1", port: 3000, baseUrl: "http://localhost:3000", managementApiToken: "management-test",
     erlcPublicKeySpkiBase64: "unused", webhookMaxClockSkewSeconds: 300, encryptionKey: crypto.randomBytes(32),
     forwardTimeoutMs: 1000, forwardMaxAttempts: 5, forwardRetryWindowMs: 900_000, workerPollMs: 100,
-    erlcApiBaseUrl: "https://api.erlc.gg/v2"
+    erlcApiBaseUrl: "https://api.erlc.gg/v2", eventRetentionDays: 14, auditRetentionDays: 90, maintenanceIntervalMs: 3_600_000
   };
   const connection: Connection = {
     id: "con_1", accountId: "acct_1", name: "Server", publicId: "pub_1", paused: false,
