@@ -149,7 +149,10 @@ export async function createApp(options: CreateAppOptions) {
   app.setErrorHandler((error, request, reply) => {
     const api = error instanceof ApiError ? error : undefined;
     const code = api?.code ?? (typeof error === "object" && error && "code" in error ? String(error.code) : "internal_error");
-    const status = api?.status ?? (code === "destination_blocked" ? 400 : code === "cursor_invalid" ? 400 : 500);
+    const reportedStatus = typeof error === "object" && error && "statusCode" in error &&
+      typeof error.statusCode === "number" && error.statusCode >= 400 && error.statusCode < 500
+      ? error.statusCode : undefined;
+    const status = api?.status ?? reportedStatus ?? (code === "destination_blocked" ? 400 : code === "cursor_invalid" ? 400 : 500);
     if (status >= 500) request.log.error({ err: error, requestId: request.id }, "request failed");
     void reply.code(status).send({ error: { code, message: api?.message ?? "Request failed.", requestId: request.id, ...(api?.extra ?? {}) } });
   });

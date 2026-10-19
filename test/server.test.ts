@@ -44,6 +44,9 @@ test("management endpoints enforce authentication, ownership, and connection lim
   assert.equal(limited.json().error.code, "limit_reached");
   const other = await app.inject({ method: "GET", url: `/v1/management/connections/${first.id}`, headers: { authorization: "Bearer management-test", "x-liberty-account-id": "acct_b" } });
   assert.equal(other.statusCode, 404);
+  const malformedDelete = await app.inject({ method: "DELETE", url: `/v1/management/connections/${first.id}`,
+    headers: { ...value.managementHeaders, "content-type": "application/json" } });
+  assert.equal(malformedDelete.statusCode, 400);
   await app.close();
 });
 
