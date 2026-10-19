@@ -1,7 +1,7 @@
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import rawBody from "fastify-raw-body";
 import type { GatewayConfig } from "./config.js";
-import { enqueueEventDeliveries, ForwardingWorker } from "./forwarding.js";
+import { enqueueEventDeliveries, ForwardingWorker, legacyEasyEvent } from "./forwarding.js";
 import { DEFAULT_LIMITS, RUNTIME_LIMITS } from "./limits.js";
 import { decodeCursor, normalizeWebhookEvent } from "./normalization.js";
 import { MaintenanceWorker } from "./maintenance.js";
@@ -96,6 +96,7 @@ function connectionJson(value: Connection, baseUrl: string, outputs?: { poll: nu
         pollSubscriptions: outputs.poll,
         signedProxyDestinations: outputs.destinations.filter(item => item.type === "signedProxy").length,
         rawMirrorDestinations: outputs.destinations.filter(item => item.type === "rawMirror").length,
+        legacyEasyDestinations: outputs.destinations.filter(item => item.type === "legacyEasy").length,
         hostedAutomations: outputs.rules > 0,
         enabledRules: outputs.rules
       }
@@ -671,7 +672,7 @@ export async function createApp(options: CreateAppOptions) {
     const limit = Math.min(Math.max(Number(request.query.limit ?? 50), 1), 100);
     const page = await store.listEvents(connection.id, { limit, pendingForSubscriptionId: subscription.id });
     if (page.events.length) await store.acknowledgeEvents(subscription.id, page.events.map(event => event.id), new Date().toISOString());
-    return { count: page.events.length, events: page.events.map(event => eventJson(event)), hasMore: page.hasMore };
+    return { count: page.events.length, events: page.events.map(legacyEasyEvent), hasMore: page.hasMore };
   });
 
   app.addHook("onClose", async () => { worker.stop(); ruleWorker.stop(); maintenanceWorker.stop(); await store.close(); });

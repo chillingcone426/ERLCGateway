@@ -1,5 +1,5 @@
 export type LegacyPreset = "poll" | "proxy" | "easy";
-export type DestinationType = "signedProxy" | "rawMirror";
+export type DestinationType = "signedProxy" | "rawMirror" | "legacyEasy";
 export type DestinationHealth = "probation" | "active" | "degraded" | "paused" | "blocked";
 export type CommandPolicy = "all" | "exclude" | "unmatchedHosted";
 

@@ -20,6 +20,31 @@ function publicEvent(event: GatewayEvent) {
   };
 }
 
+export function legacyEasyEvent(event: GatewayEvent) {
+  let payload: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(event.rawBody.toString("utf8")) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) payload = parsed as Record<string, unknown>;
+  } catch { /* Imported or malformed historical data falls back to normalized fields. */ }
+  const first = Array.isArray(payload.events) && payload.events[0] && typeof payload.events[0] === "object"
+    ? payload.events[0] as Record<string, unknown>
+    : payload;
+  const nested = first.data && typeof first.data === "object" && !Array.isArray(first.data)
+    ? first.data as Record<string, unknown>
+    : undefined;
+  const flattened = nested ?? Object.fromEntries(Object.entries(first).filter(([key]) =>
+    !["event", "type", "origin", "userId", "userID", "timestamp", "server", "data"].includes(key)));
+  const data = Object.keys(flattened).length ? flattened : event.data;
+  const server = payload.server ?? first.server ?? event.data.server;
+  return {
+    event: first.event ?? first.type ?? event.originalType ?? event.type,
+    userId: first.origin ?? first.userId ?? first.userID ?? event.data.userId ?? "",
+    timestamp: first.timestamp ?? event.occurredAt,
+    ...data,
+    ...(server !== undefined ? { server } : event.serverId ? { server: { id: event.serverId } } : {})
+  };
+}
+
 function commandName(event: GatewayEvent) {
   return event.type === "CustomCommand" && typeof event.data.command === "string"
     ? event.data.command.toLowerCase()
@@ -196,7 +221,7 @@ export class ForwardingWorker {
     const timestamp = String(Math.floor(this.#now() / 1000));
     const body = destination.type === "rawMirror"
       ? event.rawBody
-      : Buffer.from(JSON.stringify(publicEvent(event)), "utf8");
+      : Buffer.from(JSON.stringify(destination.type === "legacyEasy" ? legacyEasyEvent(event) : publicEvent(event)), "utf8");
     const headers: Record<string, string> = destination.type === "rawMirror"
       ? {
           "content-type": "application/json",
@@ -206,7 +231,14 @@ export class ForwardingWorker {
           "x-liberty-delivery-id": job.id,
           via: "LibertyTools"
         }
-      : {
+      : destination.type === "legacyEasy"
+        ? {
+            "content-type": "application/json",
+            "x-liberty-event-id": event.id,
+            "x-liberty-delivery-id": job.id,
+            via: "LibertyTools"
+          }
+        : {
           "content-type": "application/json",
           "x-liberty-event-id": event.id,
           "x-liberty-delivery-id": job.id,

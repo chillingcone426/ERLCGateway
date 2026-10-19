@@ -28,3 +28,33 @@ The dashboard sends `Authorization: Bearer <MANAGEMENT_API_TOKEN>` and an accoun
 4. Poll consumers use the one-time token at `/v1/poll/subscriptions/:id/events` and acknowledge completed event IDs.
 
 Run `npm run check` for the TypeScript build and test suite.
+
+## Migrating the old MongoDB service
+
+The migration command reads the old `webhooks` and optional `webhookEvents`
+collections and writes equivalent v2 records to PostgreSQL. It never updates or
+deletes MongoDB data, keeps every existing `webhookId`, and is idempotent.
+
+Old Poll webhooks receive an internal legacy Poll subscription, old Proxy
+webhooks become exact-byte raw mirrors, and old Easy webhooks keep their original
+flattened JSON delivery format through a migration-only destination type. New
+destinations continue to use signed Proxy or raw mirror formats.
+
+```bash
+# Inspect the plan. This is the default and does not write PostgreSQL.
+MONGO_URI=mongodb://127.0.0.1:27017 \
+MONGO_DB_NAME=erlc_gateway \
+npm run migrate:mongodb -- --report migration-dry-run.json
+
+# Apply after reviewing the dry-run report. Queued events are optional.
+MONGO_URI=mongodb://127.0.0.1:27017 \
+MONGO_DB_NAME=erlc_gateway \
+DATABASE_URL=postgres://libertytools:libertytools@localhost:5432/libertytools \
+npm run migrate:mongodb -- --apply --include-events --report migration-applied.json
+```
+
+Reports are created with exclusive-write semantics so an existing report cannot
+be overwritten. Blocked, private, malformed, or missing destination URLs do not
+prevent the connection and stable webhook ID from being migrated; the report
+marks those connections for manual destination repair. Imported queued events
+are stored for Poll retrieval and are not forwarded again.

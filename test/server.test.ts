@@ -251,6 +251,9 @@ test("legacy ingest and Poll paths adapt to a v2-backed connection", async () =>
   assert.equal(ingest.statusCode, 202, ingest.body);
   const first = await app.inject({ method: "GET", url: `/webhook/${connection.publicId}/events` });
   assert.equal(first.json().events.length, 1);
+  assert.equal(first.json().events[0].event, "CustomCommand");
+  assert.equal(first.json().events[0].userId, "42");
+  assert.equal(first.json().events[0].command, "help");
   const second = await app.inject({ method: "GET", url: `/webhook/${connection.publicId}/events` });
   assert.equal(second.json().events.length, 0);
   await app.close();

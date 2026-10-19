@@ -24,7 +24,9 @@ function normalizeType(value: string | undefined) {
     emergencycall: "EmergencyCall",
     modcall: "ModCall",
     playerjoin: "PlayerJoin",
+    playerjoined: "PlayerJoin",
     playerleave: "PlayerLeave",
+    playerleft: "PlayerLeave",
     webhookprobe: "WebhookProbe"
   };
   return known[lower]
