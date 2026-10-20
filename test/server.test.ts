@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import test from "node:test";
 import type { GatewayConfig } from "../src/config.js";
 import { MemoryGatewayStore } from "../src/memory-store.js";
+import { encryptSecret } from "../src/security.js";
 import { createApp } from "../src/server.js";
 
 function setup() {
@@ -57,6 +58,27 @@ test("server key validation uses the public app key and fails closed when it is 
   assert.equal(requests[0]?.get("Server-Key"), "privatePart-PublicServerId");
   assert.equal(accepted.json().connection.server.id, "PublicServerId");
   assert.doesNotMatch(accepted.body, /public-app-test-key|privatePart/);
+  await app.close();
+});
+
+test("existing encrypted server keys provide the authorization server ID without reconnecting", async () => {
+  const value = setup();
+  const { app } = await createApp({ config: value.config, store: value.store });
+  const created = await createConnection(app, value.managementHeaders);
+  const stored = await value.store.getConnection(created.id);
+  assert.ok(stored);
+  await value.store.updateConnection({
+    ...stored,
+    encryptedServerKey: encryptSecret("privatePart-PublicServerId", value.config.encryptionKey),
+    serverName: "Main",
+    serverId: "legacyNumericId"
+  });
+  const detail = await app.inject({ method: "GET", url: `/v1/management/connections/${created.id}`, headers: value.managementHeaders });
+  assert.equal(detail.json().connection.server.id, "PublicServerId");
+  assert.doesNotMatch(detail.body, /privatePart|legacyNumericId/);
+  const list = await app.inject({ method: "GET", url: "/v1/management/connections", headers: value.managementHeaders });
+  assert.equal(list.json().connections[0].server.id, "PublicServerId");
+  assert.doesNotMatch(list.body, /privatePart|legacyNumericId/);
   await app.close();
 });
 

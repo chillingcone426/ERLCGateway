@@ -10,6 +10,7 @@ import { RuleEngine, RuleWorker, normalizeCommand, validateRuleDefinition } from
 import {
   constantTimeEqual,
   createToken,
+  decryptSecret,
   encryptSecret,
   hashToken,
   randomId,
@@ -81,15 +82,24 @@ function destinationFilter(value: unknown): DestinationFilter {
   };
 }
 
-function connectionJson(value: Connection, baseUrl: string, outputs?: { poll: number; destinations: ForwardDestination[]; rules: number }) {
+function connectionJson(value: Connection, config: GatewayConfig, outputs?: { poll: number; destinations: ForwardDestination[]; rules: number }) {
+  let serverId: string | undefined;
+  if (value.encryptedServerKey) {
+    try {
+      serverId = erlcInternalServerId(decryptSecret(value.encryptedServerKey, config.encryptionKey));
+    } catch {
+      // Keep the connection visible if an older credential cannot be decrypted.
+    }
+    serverId ||= value.serverId;
+  }
   return {
     id: value.id,
     name: value.name,
     publicId: value.publicId,
-    ingestUrl: `${baseUrl}/v1/ingest/${value.publicId}`,
+    ingestUrl: `${config.baseUrl}/v1/ingest/${value.publicId}`,
     paused: value.paused,
     ...(value.legacyPreset ? { legacyPreset: value.legacyPreset } : {}),
-    ...(value.serverId ? { server: { id: value.serverId, ...(value.serverName ? { name: value.serverName } : {}) } } : {}),
+    ...(serverId ? { server: { id: serverId, ...(value.serverName ? { name: value.serverName } : {}) } } : {}),
     serverCredentialConfigured: Boolean(value.encryptedServerKey),
     ...(value.serverKeyFingerprint ? { serverKeyFingerprint: value.serverKeyFingerprint } : {}),
     ...(outputs ? {
@@ -194,7 +204,7 @@ export async function createApp(options: CreateAppOptions) {
   app.get("/v1/management/connections", async request => {
     const owner = accountId(request);
     const connections = await store.listConnections(owner);
-    const shaped = await Promise.all(connections.map(async connection => connectionJson(connection, config.baseUrl, {
+    const shaped = await Promise.all(connections.map(async connection => connectionJson(connection, config, {
       poll: (await store.listPollSubscriptions(connection.id)).length,
       destinations: await store.listDestinations(connection.id),
       rules: (await store.listRules(connection.id)).filter(rule => rule.enabled).length
@@ -225,12 +235,12 @@ export async function createApp(options: CreateAppOptions) {
       ...(["poll", "proxy", "easy"].includes(String(input.mode)) ? { legacyPreset: String(input.mode) as NonNullable<Connection["legacyPreset"]> } : {})
     };
     await store.createConnection(connection);
-    return reply.code(201).send({ connection: connectionJson(connection, config.baseUrl), limits: DEFAULT_LIMITS });
+    return reply.code(201).send({ connection: connectionJson(connection, config), limits: DEFAULT_LIMITS });
   });
 
   app.get<{ Params: { id: string } }>("/v1/management/connections/:id", async request => {
     const connection = await ownedConnection(store, request.params.id, accountId(request));
-    return { connection: connectionJson(connection, config.baseUrl, {
+    return { connection: connectionJson(connection, config, {
       poll: (await store.listPollSubscriptions(connection.id)).length,
       destinations: await store.listDestinations(connection.id),
       rules: (await store.listRules(connection.id)).filter(rule => rule.enabled).length
@@ -247,7 +257,7 @@ export async function createApp(options: CreateAppOptions) {
       updatedAt: new Date().toISOString()
     };
     await store.updateConnection(updated);
-    return { connection: connectionJson(updated, config.baseUrl) };
+    return { connection: connectionJson(updated, config) };
   });
 
   app.delete<{ Params: { id: string } }>("/v1/management/connections/:id", async (request, reply) => {
@@ -289,7 +299,7 @@ export async function createApp(options: CreateAppOptions) {
       updatedAt: new Date().toISOString()
     };
     await store.updateConnection(updated);
-    return { connection: connectionJson(updated, config.baseUrl) };
+    return { connection: connectionJson(updated, config) };
   });
 
   app.delete<{ Params: { id: string } }>("/v1/management/connections/:id/server-credential", async request => {
@@ -297,7 +307,7 @@ export async function createApp(options: CreateAppOptions) {
     const { encryptedServerKey: _encrypted, serverKeyFingerprint: _fingerprint, ...rest } = connection;
     const updated: Connection = { ...rest, updatedAt: new Date().toISOString() };
     await store.updateConnection(updated);
-    return { connection: connectionJson(updated, config.baseUrl) };
+    return { connection: connectionJson(updated, config) };
   });
 
   app.get<{ Params: { id: string } }>("/v1/management/connections/:id/poll-subscriptions", async request => {
