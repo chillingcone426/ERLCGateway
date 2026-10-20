@@ -402,6 +402,16 @@ export class PostgresGatewayStore implements GatewayStore {
       return { allowed: true, retryAfterMs: 0 };
     });
   }
+  async remainingCooldown(key: string, now = Date.now()) {
+    const result = await this.pool.query("SELECT available_at FROM cooldowns WHERE key=$1", [key]);
+    const availableAt = result.rows[0] ? new Date(result.rows[0].available_at).getTime() : 0;
+    return Math.max(0, availableAt - now);
+  }
+  async setCooldown(key: string, durationMs: number, now = Date.now()) {
+    await this.pool.query(`INSERT INTO cooldowns(key,available_at) VALUES($1,$2)
+      ON CONFLICT(key) DO UPDATE SET available_at=GREATEST(cooldowns.available_at,EXCLUDED.available_at)`,
+    [key, new Date(now + durationMs).toISOString()]);
+  }
 
   private async transaction<T>(run: (client: PoolClient) => Promise<T>) {
     const client = await this.pool.connect();

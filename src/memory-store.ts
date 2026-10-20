@@ -214,6 +214,12 @@ export class MemoryGatewayStore implements GatewayStore {
     this.cooldowns.set(key, now + durationMs);
     return { allowed: true, retryAfterMs: 0 };
   }
+  async remainingCooldown(key: string, now = Date.now()) {
+    return Math.max(0, (this.cooldowns.get(key) ?? 0) - now);
+  }
+  async setCooldown(key: string, durationMs: number, now = Date.now()) {
+    this.cooldowns.set(key, Math.max(this.cooldowns.get(key) ?? 0, now + durationMs));
+  }
   async recordAudit(entry: AuditEntry) { this.auditEntries.push(entry); }
   async listAudit(accountId: string, connectionId: string | undefined, limit: number) {
     return this.auditEntries.filter(value => value.accountId === accountId && (!connectionId || value.connectionId === connectionId))

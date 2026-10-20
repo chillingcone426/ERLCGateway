@@ -182,7 +182,7 @@ test("rule builder dry-runs and publishes only after a server credential is conf
   const connection = await createConnection(app, value.managementHeaders);
   const created = await app.inject({
     method: "POST", url: `/v1/management/connections/${connection.id}/rules`, headers: value.managementHeaders,
-    payload: { name: "Help", draft: { trigger: { type: "customCommand", command: ";help" }, conditions: [], actions: [{ type: "privateReply", message: "Hello {{player.username}}" }], cooldown: { durationMs: 2000, scope: "player" } } }
+    payload: { name: "Help", draft: { trigger: { type: "customCommand", command: ";help" }, conditions: [], actions: [{ type: "privateReply", message: "Hello {{player.username}}" }], cooldown: { durationMs: 5000, scope: "player" } } }
   });
   assert.equal(created.statusCode, 201, created.body);
   const rule = created.json().rule as { id: string; draftVersion: number };
@@ -267,7 +267,7 @@ test("signed ingestion persists hosted-command jobs before a worker executes the
   const connection = await createConnection(app, value.managementHeaders);
   await app.inject({ method: "PUT", url: `/v1/management/connections/${connection.id}/server-credential`, headers: value.managementHeaders, payload: { serverKey: "server-key" } });
   const created = await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/rules`, headers: value.managementHeaders,
-    payload: { name: "Help", draft: { trigger: { type: "customCommand", command: ";help" }, conditions: [], actions: [{ type: "privateReply", message: "Hi {{player.username}}" }], cooldown: { durationMs: 2000, scope: "player" } } } });
+    payload: { name: "Help", draft: { trigger: { type: "customCommand", command: ";help" }, conditions: [], actions: [{ type: "privateReply", message: "Hi {{player.username}}" }], cooldown: { durationMs: 5000, scope: "player" } } } });
   const rule = created.json().rule as { id: string; draftVersion: number };
   await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/rules/${rule.id}/publish`, headers: value.managementHeaders, payload: { draftVersion: 1 } });
   const payload = JSON.stringify({ event: "CustomCommand", command: "help", username: "TestPlayer", userId: "42", serverId: "server-1" });
@@ -305,8 +305,73 @@ test("hosted command executions retain ERLC rejection details for dashboard trou
   await app.inject({ method: "POST", url: `/v1/ingest/${connection.publicId}`, headers: value.sign(payload), payload });
   await ruleWorker.runOnce();
   assert.deepEqual(value.store.ruleExecutions[0]?.detail, {
-    actions: [{ type: "privateReply", success: false, status: 403, code: "erlc_rejected", providerCode: 4000, message: "Allowlist this server IP." }]
+    actions: [{ type: "privateReply", success: false, status: 403, code: "erlc_rejected", providerCode: 4000,
+      message: "Allowlist this server IP.", credentialDisabled: true }]
   });
+  assert.equal((await value.store.getConnection(connection.id))?.encryptedServerKey, undefined);
+  await app.close();
+});
+
+test("hosted commands enforce the ERLC command interval across queued events", async () => {
+  const value = setup();
+  const commands: string[] = [];
+  const fetchMock: typeof fetch = async (input, init) => {
+    if (String(input).endsWith("/server") && init?.method !== "POST") {
+      return new Response(JSON.stringify({ Id: "server-1", Name: "Main" }), { status: 200 });
+    }
+    if (String(input).endsWith("/server/command")) commands.push(String(JSON.parse(String(init?.body)).command));
+    return new Response(JSON.stringify({ message: "Success" }), { status: 200 });
+  };
+  const { app, ruleWorker } = await createApp({ config: value.config, store: value.store, fetch: fetchMock });
+  const connection = await createConnection(app, value.managementHeaders);
+  await app.inject({ method: "PUT", url: `/v1/management/connections/${connection.id}/server-credential`,
+    headers: value.managementHeaders, payload: { serverKey: "server-key" } });
+  const created = await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/rules`, headers: value.managementHeaders,
+    payload: { name: "Help", draft: { trigger: { type: "customCommand", command: "help" }, conditions: [], actions: [{ type: "privateReply", message: "Hi" }] } } });
+  await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/rules/${created.json().rule.id}/publish`,
+    headers: value.managementHeaders, payload: { draftVersion: 1 } });
+  for (const userId of ["1", "2"]) {
+    const payload = JSON.stringify({ event: "CustomCommand", command: "help", username: `Player${userId}`, userId });
+    await app.inject({ method: "POST", url: `/v1/ingest/${connection.publicId}`, headers: value.sign(payload), payload });
+  }
+  await ruleWorker.runOnce();
+  assert.deepEqual(commands, [":pm Player1 Hi"]);
+  assert.deepEqual(value.store.ruleExecutions.map(item => item.status), ["succeeded", "rateLimited"]);
+  assert.equal(value.store.ruleExecutions[1]?.detail.code, "rate_limited");
+  assert.ok(Number(value.store.ruleExecutions[1]?.detail.retryAfterMs) > 0);
+  await app.close();
+});
+
+test("hosted commands honor ERLC Retry-After without retrying the rejected command", async () => {
+  const value = setup();
+  let commandRequests = 0;
+  const fetchMock: typeof fetch = async (input, init) => {
+    if (String(input).endsWith("/server") && init?.method !== "POST") {
+      return new Response(JSON.stringify({ Id: "server-1", Name: "Main" }), { status: 200 });
+    }
+    commandRequests += 1;
+    return new Response(JSON.stringify({ code: 2002, message: "Slow down", retry_after: 30 }), {
+      status: 429, headers: { "retry-after": "30" }
+    });
+  };
+  const { app, ruleWorker } = await createApp({ config: value.config, store: value.store, fetch: fetchMock });
+  const connection = await createConnection(app, value.managementHeaders);
+  await app.inject({ method: "PUT", url: `/v1/management/connections/${connection.id}/server-credential`,
+    headers: value.managementHeaders, payload: { serverKey: "server-key" } });
+  const created = await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/rules`, headers: value.managementHeaders,
+    payload: { name: "Help", draft: { trigger: { type: "customCommand", command: "help" }, conditions: [], actions: [{ type: "privateReply", message: "Hi" }] } } });
+  await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/rules/${created.json().rule.id}/publish`,
+    headers: value.managementHeaders, payload: { draftVersion: 1 } });
+  for (const userId of ["1", "2"]) {
+    const payload = JSON.stringify({ event: "CustomCommand", command: "help", username: `Player${userId}`, userId });
+    await app.inject({ method: "POST", url: `/v1/ingest/${connection.publicId}`, headers: value.sign(payload), payload });
+    await ruleWorker.runOnce();
+  }
+  assert.equal(commandRequests, 1);
+  assert.equal(value.store.ruleExecutions[0]?.status, "rateLimited");
+  assert.equal((value.store.ruleExecutions[0]?.detail.actions as Array<Record<string, unknown>>)[0]?.retryAfterMs, 30_000);
+  assert.equal(value.store.ruleExecutions[1]?.status, "rateLimited");
+  assert.ok((value.store.cooldowns.get(`erlc:provider:${connection.id}`) ?? 0) > Date.now() + 25_000);
   await app.close();
 });
 

@@ -29,7 +29,7 @@ export function normalizeCommand(value: unknown) {
   return command && !/\s/.test(command) ? command : "";
 }
 
-export function validateRuleDefinition(value: unknown, limits = { conditions: 10, actions: 5 }): RuleDefinition {
+export function validateRuleDefinition(value: unknown, limits = { conditions: 10, actions: 1 }): RuleDefinition {
   if (!value || typeof value !== "object") throw Object.assign(new Error("Rule definition is required"), { code: "validation_failed" });
   const input = value as Partial<RuleDefinition>;
   if (!input.trigger || typeof input.trigger !== "object") throw Object.assign(new Error("Rule trigger is required"), { code: "validation_failed" });
@@ -107,6 +107,17 @@ export interface RuleEngineOptions {
   config: GatewayConfig;
   fetch?: typeof globalThis.fetch;
   now?: () => number;
+}
+
+interface CommandOutcome {
+  success: boolean;
+  status?: number;
+  uncertain?: boolean;
+  code?: string;
+  providerCode?: number;
+  message?: string;
+  retryAfterMs?: number;
+  credentialDisabled?: boolean;
 }
 
 export class RuleEngine {
@@ -192,14 +203,40 @@ export class RuleEngine {
     }
     const results: Array<Record<string, unknown>> = [];
     for (const action of definition.actions) {
+      const providerRetryAfterMs = await this.#store.remainingCooldown(`erlc:provider:${connection.id}`, this.#now());
+      if (providerRetryAfterMs > 0) {
+        await this.#store.recordRuleExecution({ ...execution, status: "rateLimited",
+          detail: { code: "rate_limited", retryAfterMs: providerRetryAfterMs }, completedAt: new Date(this.#now()).toISOString() });
+        return;
+      }
+      const commandSlot = await this.#store.takeCooldown(`erlc:command:${connection.id}`,
+        RUNTIME_LIMITS.erlcCommandMinimumIntervalMs, this.#now());
+      if (!commandSlot.allowed) {
+        await this.#store.recordRuleExecution({ ...execution, status: "rateLimited",
+          detail: { code: "rate_limited", retryAfterMs: commandSlot.retryAfterMs }, completedAt: new Date(this.#now()).toISOString() });
+        return;
+      }
       const command = this.#commandForAction(action, event, username);
       const outcome = await this.#sendCommand(serverKey, command);
-      results.push({ type: action.type, ...outcome });
       if (!outcome.success) {
-        const status = outcome.uncertain ? "uncertain" : "failed";
+        if (outcome.status === 429) {
+          await this.#store.setCooldown(`erlc:provider:${connection.id}`,
+            outcome.retryAfterMs ?? RUNTIME_LIMITS.erlcCommandMinimumIntervalMs, this.#now());
+        }
+        if (outcome.status === 401 || outcome.status === 403) {
+          const { encryptedServerKey: _encrypted, serverKeyFingerprint: _fingerprint, ...withoutCredential } = connection;
+          await this.#store.updateConnection({ ...withoutCredential, updatedAt: new Date(this.#now()).toISOString() });
+          outcome.credentialDisabled = true;
+        }
+        if ([400, 404].includes(outcome.status ?? 0)) {
+          await this.#store.setCooldown(`erlc:provider:${connection.id}`, 60_000, this.#now());
+        }
+        results.push({ type: action.type, ...outcome });
+        const status = outcome.status === 429 ? "rateLimited" : outcome.uncertain ? "uncertain" : "failed";
         await this.#store.recordRuleExecution({ ...execution, status, detail: { actions: results }, completedAt: new Date(this.#now()).toISOString() });
         return;
       }
+      results.push({ type: action.type, ...outcome });
     }
     await this.#store.recordRuleExecution({ ...execution, status: "succeeded", detail: { actions: results }, completedAt: new Date(this.#now()).toISOString() });
   }
@@ -235,7 +272,7 @@ export class RuleEngine {
     return "";
   }
 
-  async #sendCommand(serverKey: string, command: string) {
+  async #sendCommand(serverKey: string, command: string): Promise<CommandOutcome> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.#config.forwardTimeoutMs);
     try {
@@ -246,17 +283,31 @@ export class RuleEngine {
       if (response.ok) return { success: true, status: response.status };
       const responseText = await response.text().catch(() => "");
       let providerCode: number | undefined;
+      let retryAfterMs: number | undefined;
       let message = responseText.slice(0, 300);
       try {
-        const providerError = JSON.parse(responseText) as { code?: unknown; message?: unknown };
+        const providerError = JSON.parse(responseText) as { code?: unknown; message?: unknown; retry_after?: unknown };
         if (typeof providerError.code === "number") providerCode = providerError.code;
         if (typeof providerError.message === "string") message = providerError.message.slice(0, 300);
+        if (typeof providerError.retry_after === "number" && Number.isFinite(providerError.retry_after)) {
+          retryAfterMs = Math.max(0, providerError.retry_after * 1000);
+        }
       } catch {}
+      if (response.status === 429) {
+        const retryAfter = response.headers.get("retry-after");
+        if (retryAfter) {
+          const seconds = Number(retryAfter);
+          const dateMs = Date.parse(retryAfter);
+          if (Number.isFinite(seconds)) retryAfterMs = Math.max(0, seconds * 1000);
+          else if (Number.isFinite(dateMs)) retryAfterMs = Math.max(0, dateMs - this.#now());
+        }
+      }
       return {
         success: false,
         status: response.status,
-        code: "erlc_rejected",
+        code: response.status === 429 ? "rate_limited" : "erlc_rejected",
         ...(providerCode !== undefined ? { providerCode } : {}),
+        ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
         ...(message ? { message } : {})
       };
     } catch (error) {

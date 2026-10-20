@@ -80,6 +80,8 @@ export interface GatewayStore {
     retryAfterMs: number;
   }>;
   takeCooldown(key: string, durationMs: number, now?: number): Promise<{ allowed: boolean; retryAfterMs: number }>;
+  remainingCooldown(key: string, now?: number): Promise<number>;
+  setCooldown(key: string, durationMs: number, now?: number): Promise<void>;
   recordAudit(entry: AuditEntry): Promise<void>;
   listAudit(accountId: string, connectionId: string | undefined, limit: number): Promise<AuditEntry[]>;
   cleanup(beforeEvents: string, beforeAudit: string): Promise<{ events: number; audit: number }>;

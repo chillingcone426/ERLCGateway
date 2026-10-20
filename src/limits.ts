@@ -7,7 +7,7 @@ export const DEFAULT_LIMITS: UsageLimits = Object.freeze({
   rawMirrorsPerConnection: 1,
   rulesPerConnection: 20,
   conditionsPerRule: 10,
-  actionsPerRule: 5
+  actionsPerRule: 1
 });
 
 export const RUNTIME_LIMITS = Object.freeze({
@@ -26,7 +26,8 @@ export const RUNTIME_LIMITS = Object.freeze({
   destinationChangesPerHour: 5,
   hostedActionsPerConnectionMinute: 30,
   hostedActionsPerAccountMinute: 100,
-  minimumPlayerCooldownMs: 2_000,
+  erlcCommandMinimumIntervalMs: 5_000,
+  minimumPlayerCooldownMs: 5_000,
   maxMessageLength: 200,
   maxInboundBytes: 256 * 1024,
   maxResponseExcerptBytes: 4 * 1024
