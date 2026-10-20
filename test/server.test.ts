@@ -12,7 +12,8 @@ function setup() {
     managementApiToken: "management-test", erlcPublicKeySpkiBase64: publicKey.export({ format: "der", type: "spki" }).toString("base64"),
     webhookMaxClockSkewSeconds: 300, encryptionKey: crypto.randomBytes(32), forwardTimeoutMs: 1000,
     forwardMaxAttempts: 5, forwardRetryWindowMs: 900_000, workerPollMs: 100,
-    erlcApiBaseUrl: "https://api.erlc.test/v2", eventRetentionDays: 14, auditRetentionDays: 90, maintenanceIntervalMs: 3_600_000
+    erlcApiBaseUrl: "https://api.erlc.test/v2", eventRetentionDays: 14, auditRetentionDays: 90, maintenanceIntervalMs: 3_600_000,
+    hostedCommandsEnabled: true
   };
   const store = new MemoryGatewayStore();
   const managementHeaders = { authorization: "Bearer management-test", "x-liberty-account-id": "acct_a" };

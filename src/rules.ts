@@ -38,9 +38,7 @@ export function validateRuleDefinition(value: unknown, limits = { conditions: 10
     const command = normalizeCommand(input.trigger.command);
     if (!command) throw Object.assign(new Error("Custom command name is invalid"), { code: "validation_failed" });
     trigger = { type: "customCommand", command };
-  } else if (input.trigger.type === "event" && typeof input.trigger.eventType === "string" && input.trigger.eventType.trim()) {
-    trigger = { type: "event", eventType: input.trigger.eventType.trim() };
-  } else throw Object.assign(new Error("Rule trigger is invalid"), { code: "validation_failed" });
+  } else throw Object.assign(new Error("Hosted actions currently require a custom command trigger"), { code: "validation_failed" });
 
   const conditions = Array.isArray(input.conditions) ? input.conditions : [];
   const actions = Array.isArray(input.actions) ? input.actions : [];
@@ -172,6 +170,12 @@ export class RuleEngine {
     const execution: RuleExecution = {
       id: randomId("exe"), ruleId: rule.id, eventId: event.id, status: "running", detail: {}, createdAt
     };
+    if (!this.#config.hostedCommandsEnabled) {
+      await this.#store.recordRuleExecution({ ...execution, status: "skipped",
+        detail: { code: "hosted_commands_disabled", reason: "Hosted commands are temporarily disabled by LibertyTools." },
+        completedAt: createdAt });
+      return;
+    }
     if (definition.cooldown) {
       const scopeValue = definition.cooldown.scope === "player" ? playerId(event)
         : definition.cooldown.scope === "command" ? commandName(event) : event.serverId ?? event.connectionId;
@@ -185,14 +189,6 @@ export class RuleEngine {
     const connection = await this.#store.getConnection(event.connectionId);
     if (!connection?.encryptedServerKey) {
       await this.#store.recordRuleExecution({ ...execution, status: "failed", detail: { code: "credential_invalid" }, completedAt: createdAt });
-      return;
-    }
-    const budgets = await Promise.all([
-      this.#store.takeRateLimit(`actions:connection:${connection.id}`, RUNTIME_LIMITS.hostedActionsPerConnectionMinute, 60_000, this.#now()),
-      this.#store.takeRateLimit(`actions:account:${connection.accountId}`, RUNTIME_LIMITS.hostedActionsPerAccountMinute, 60_000, this.#now())
-    ]);
-    if (budgets.some(value => !value.allowed)) {
-      await this.#store.recordRuleExecution({ ...execution, status: "rateLimited", detail: { code: "rate_limited" }, completedAt: createdAt });
       return;
     }
     const serverKey = decryptSecret(connection.encryptedServerKey, this.#config.encryptionKey);
@@ -214,6 +210,32 @@ export class RuleEngine {
       if (!commandSlot.allowed) {
         await this.#store.recordRuleExecution({ ...execution, status: "rateLimited",
           detail: { code: "rate_limited", retryAfterMs: commandSlot.retryAfterMs }, completedAt: new Date(this.#now()).toISOString() });
+        return;
+      }
+      if (action.type === "announce") {
+        const announcementSlot = await this.#store.takeCooldown(`erlc:announcement:${connection.id}`,
+          RUNTIME_LIMITS.erlcAnnouncementMinimumIntervalMs, this.#now());
+        if (!announcementSlot.allowed) {
+          await this.#store.recordRuleExecution({ ...execution, status: "rateLimited",
+            detail: { code: "announcement_rate_limited", retryAfterMs: announcementSlot.retryAfterMs },
+            completedAt: new Date(this.#now()).toISOString() });
+          return;
+        }
+      }
+      const budgets = await Promise.all([
+        this.#store.takeRateLimit(`actions:connection:${connection.id}:minute`, RUNTIME_LIMITS.hostedActionsPerConnectionMinute, 60_000, this.#now()),
+        this.#store.takeRateLimit(`actions:account:${connection.accountId}:minute`, RUNTIME_LIMITS.hostedActionsPerAccountMinute, 60_000, this.#now()),
+        this.#store.takeRateLimit(`actions:connection:${connection.id}:day`, RUNTIME_LIMITS.hostedActionsPerConnectionDay, 24 * 60 * 60_000, this.#now()),
+        this.#store.takeRateLimit(`actions:account:${connection.accountId}:day`, RUNTIME_LIMITS.hostedActionsPerAccountDay, 24 * 60 * 60_000, this.#now())
+      ]);
+      const blockedBudget = budgets.find(value => !value.allowed);
+      if (blockedBudget) {
+        const disabledRule = { ...rule, enabled: false, updatedAt: new Date(this.#now()).toISOString() };
+        await this.#store.updateRule(disabledRule);
+        await this.#store.recordRuleExecution({ ...execution, status: "rateLimited",
+          detail: { code: "safety_limit_reached", circuitBreaker: true, retryAfterMs: blockedBudget.retryAfterMs,
+            reason: "This command was disabled after reaching a hosted-action safety limit." },
+          completedAt: new Date(this.#now()).toISOString() });
         return;
       }
       const command = this.#commandForAction(action, event, username);

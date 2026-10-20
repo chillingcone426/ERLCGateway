@@ -9,6 +9,13 @@ function integer(value: string | undefined, fallback: number, name: string) {
   return parsed;
 }
 
+function boolean(value: string | undefined, fallback: boolean, name: string) {
+  if (value === undefined || value === "") return fallback;
+  if (["1", "true", "yes", "on"].includes(value.toLowerCase())) return true;
+  if (["0", "false", "no", "off"].includes(value.toLowerCase())) return false;
+  throw new Error(`${name} must be a boolean`);
+}
+
 function base64Key(value: string | undefined, required: boolean) {
   if (!value) {
     if (required) throw new Error("SECRET_ENCRYPTION_KEY_BASE64 is required in production");
@@ -36,6 +43,7 @@ export interface GatewayConfig {
   eventRetentionDays: number;
   auditRetentionDays: number;
   maintenanceIntervalMs: number;
+  hostedCommandsEnabled: boolean;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
@@ -57,6 +65,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     erlcApiBaseUrl: (env.ERLC_API_BASE_URL ?? "https://api.erlc.gg/v2").replace(/\/$/, ""),
     eventRetentionDays: integer(env.EVENT_RETENTION_DAYS, 14, "EVENT_RETENTION_DAYS"),
     auditRetentionDays: integer(env.AUDIT_RETENTION_DAYS, 90, "AUDIT_RETENTION_DAYS"),
-    maintenanceIntervalMs: integer(env.MAINTENANCE_INTERVAL_MS, 60 * 60_000, "MAINTENANCE_INTERVAL_MS")
+    maintenanceIntervalMs: integer(env.MAINTENANCE_INTERVAL_MS, 60 * 60_000, "MAINTENANCE_INTERVAL_MS"),
+    hostedCommandsEnabled: boolean(env.HOSTED_COMMANDS_ENABLED, true, "HOSTED_COMMANDS_ENABLED")
   };
 }
