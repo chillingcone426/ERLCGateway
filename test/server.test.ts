@@ -281,6 +281,35 @@ test("signed ingestion persists hosted-command jobs before a worker executes the
   await app.close();
 });
 
+test("hosted command executions retain ERLC rejection details for dashboard troubleshooting", async () => {
+  const value = setup();
+  const fetchMock: typeof fetch = async (input, init) => {
+    if (String(input).endsWith("/server") && init?.method !== "POST") {
+      return new Response(JSON.stringify({ Id: "server-1", Name: "Main" }), { status: 200 });
+    }
+    if (String(input).includes("Players=true")) {
+      return new Response(JSON.stringify({ Players: [{ Player: "TestPlayer:42" }] }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ code: 4000, message: "Allowlist this server IP." }), { status: 403 });
+  };
+  const { app, ruleWorker } = await createApp({ config: value.config, store: value.store, fetch: fetchMock });
+  const connection = await createConnection(app, value.managementHeaders);
+  await app.inject({ method: "PUT", url: `/v1/management/connections/${connection.id}/server-credential`, headers: value.managementHeaders, payload: { serverKey: "server-key" } });
+  const created = await app.inject({
+    method: "POST", url: `/v1/management/connections/${connection.id}/rules`, headers: value.managementHeaders,
+    payload: { name: "Help", draft: { trigger: { type: "customCommand", command: "help" }, conditions: [], actions: [{ type: "privateReply", message: "Hi" }] } }
+  });
+  const rule = created.json().rule as { id: string };
+  await app.inject({ method: "POST", url: `/v1/management/connections/${connection.id}/rules/${rule.id}/publish`, headers: value.managementHeaders, payload: { draftVersion: 1 } });
+  const payload = JSON.stringify({ event: "CustomCommand", command: "help", userId: "42" });
+  await app.inject({ method: "POST", url: `/v1/ingest/${connection.publicId}`, headers: value.sign(payload), payload });
+  await ruleWorker.runOnce();
+  assert.deepEqual(value.store.ruleExecutions[0]?.detail, {
+    actions: [{ type: "privateReply", success: false, status: 403, code: "erlc_rejected", providerCode: 4000, message: "Allowlist this server IP." }]
+  });
+  await app.close();
+});
+
 test("legacy ingest and Poll paths adapt to a v2-backed connection", async () => {
   const value = setup();
   const { app } = await createApp({ config: value.config, store: value.store });

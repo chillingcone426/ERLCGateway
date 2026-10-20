@@ -243,9 +243,22 @@ export class RuleEngine {
         method: "POST", headers: { "content-type": "application/json", "server-key": serverKey },
         body: JSON.stringify({ command }), signal: controller.signal
       });
-      return response.ok
-        ? { success: true, status: response.status }
-        : { success: false, status: response.status, code: "erlc_rejected" };
+      if (response.ok) return { success: true, status: response.status };
+      const responseText = await response.text().catch(() => "");
+      let providerCode: number | undefined;
+      let message = responseText.slice(0, 300);
+      try {
+        const providerError = JSON.parse(responseText) as { code?: unknown; message?: unknown };
+        if (typeof providerError.code === "number") providerCode = providerError.code;
+        if (typeof providerError.message === "string") message = providerError.message.slice(0, 300);
+      } catch {}
+      return {
+        success: false,
+        status: response.status,
+        code: "erlc_rejected",
+        ...(providerCode !== undefined ? { providerCode } : {}),
+        ...(message ? { message } : {})
+      };
     } catch (error) {
       return { success: false, uncertain: true, code: error instanceof Error ? error.name : "network_error" };
     } finally {
