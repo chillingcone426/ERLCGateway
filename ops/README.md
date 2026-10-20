@@ -4,14 +4,16 @@ The gateway and dashboard run from versioned releases under
 `/home/thebeston123/liberty-v2-production/releases`. Their `gateway` and
 `dashboard` symlinks select the live releases. `auto-deploy.py` polls the
 `platform-v2` gateway branch and `dashboard-v2-roadmap` dashboard branch every
-five minutes. It deploys an exact commit only after every GitHub Actions check
-for that commit succeeds. Each release runs `npm ci` and `npm run check` before
+five minutes. The public gateway deploys an exact commit only after every
+GitHub Actions check for that commit succeeds. The private dashboard uses
+GitHub Actions workflow-run status for the same CI gate. Each release runs
+`npm ci` and `npm run check` before
 the symlink changes. A failed restart or health check restores the previous
 symlink and restarts the old release.
 
 The gateway repository is public. The dashboard repository is private and
 requires a fine-grained GitHub token scoped only to
-`Liberty-Tools/LibertyToolsDash` with **Contents: Read** and **Checks: Read**.
+`Liberty-Tools/LibertyToolsDash` with **Contents: Read** and **Actions: Read**.
 Install it with `python3 shared/install-private-value.py github` in an
 interactive SSH session. Never paste the token into a ticket, chat, command
 argument, or repository file. It is stored mode 0600 in `shared/github-read-token`.

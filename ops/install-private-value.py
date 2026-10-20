@@ -10,7 +10,7 @@ root = Path("/home/thebeston123/liberty-v2-production/shared")
 kind = sys.argv[1] if len(sys.argv) == 2 else ""
 if kind == "github":
     target = root / "github-read-token"
-    prompt = "GitHub fine-grained read-only token (Dashboard Contents + Checks): "
+    prompt = "GitHub fine-grained read-only token (Dashboard Contents + Actions): "
 elif kind == "discord":
     target = root / "ops-discord-webhook"
     prompt = "Discord operator-alert webhook URL: "

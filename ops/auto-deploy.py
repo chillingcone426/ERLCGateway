@@ -32,10 +32,16 @@ def get_json(url, token=None):
         return json.load(response)
 
 
-def tested_head(repo, branch, token):
+def tested_head(repo, branch, token, private):
     sha = get_json(f"https://api.github.com/repos/{repo}/commits/{branch}", token)["sha"]
     if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
         raise RuntimeError("GitHub returned an invalid commit SHA")
+    if private:
+        result = get_json(f"https://api.github.com/repos/{repo}/actions/runs?head_sha={sha}&per_page=100", token)
+        runs = [run for run in result["workflow_runs"] if run.get("head_sha") == sha]
+        if result.get("total_count", 0) > 100 or not runs:
+            return sha, False
+        return sha, all(run.get("status") == "completed" and run.get("conclusion") == "success" for run in runs)
     checks = get_json(f"https://api.github.com/repos/{repo}/commits/{sha}/check-runs", token)["check_runs"]
     actions = [run for run in checks if run.get("app", {}).get("slug") == "github-actions"]
     if not actions or any(run.get("status") != "completed" or run.get("conclusion") != "success" for run in actions):
@@ -116,10 +122,11 @@ def main():
             if dry_run:
                 print(f"{repo}: read-only GitHub token not installed")
             continue
-        sha, checks_passed = tested_head(repo, branch, token if private else None)
+        sha, checks_passed = tested_head(repo, branch, token if private else None, private)
         current = (ROOT / prefix).resolve(strict=True).name
         if dry_run:
-            print(f"{repo}: head={sha[:7]} checks={'passed' if checks_passed else 'pending-or-failed'} current={current}")
+            validation = ('github-ci-passed' if checks_passed else 'github-ci-pending-or-failed')
+            print(f"{repo}: head={sha[:7]} validation={validation} current={current}")
         elif checks_passed and current != f"{prefix}-{sha[:7]}":
             deploy(repo, sha, prefix, service, health_url, token if private else None)
 
