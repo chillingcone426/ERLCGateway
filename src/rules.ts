@@ -1,4 +1,5 @@
 import type { GatewayConfig } from "./config.js";
+import { erlcHeaders, erlcRetryAfterMs } from "./erlc.js";
 import { RUNTIME_LIMITS } from "./limits.js";
 import { decryptSecret, randomId } from "./security.js";
 import type { GatewayStore } from "./store.js";
@@ -176,6 +177,12 @@ export class RuleEngine {
         completedAt: createdAt });
       return;
     }
+    if (!this.#config.erlcGlobalApiKey) {
+      await this.#store.recordRuleExecution({ ...execution, status: "failed",
+        detail: { code: "erlc_global_key_missing", reason: "LibertyTools has not configured its ER:LC public application key." },
+        completedAt: createdAt });
+      return;
+    }
     if (definition.cooldown) {
       const scopeValue = definition.cooldown.scope === "player" ? playerId(event)
         : definition.cooldown.scope === "command" ? commandName(event) : event.serverId ?? event.connectionId;
@@ -194,18 +201,25 @@ export class RuleEngine {
     const serverKey = decryptSecret(connection.encryptedServerKey, this.#config.encryptionKey);
     const username = await this.#resolveUsername(event, serverKey);
     if (!username && definition.actions.some(action => action.type === "privateReply")) {
-      await this.#store.recordRuleExecution({ ...execution, status: "failed", detail: { code: "player_not_found" }, completedAt: createdAt });
+      const retryAfterMs = Math.max(
+        await this.#store.remainingCooldown("erlc:provider:global", this.#now()),
+        await this.#store.remainingCooldown(`erlc:provider:${connection.id}`, this.#now()));
+      await this.#store.recordRuleExecution({ ...execution, status: retryAfterMs > 0 ? "rateLimited" : "failed",
+        detail: retryAfterMs > 0 ? { code: "rate_limited", retryAfterMs } : { code: "player_not_found" },
+        completedAt: createdAt });
       return;
     }
     const results: Array<Record<string, unknown>> = [];
     for (const action of definition.actions) {
-      const providerRetryAfterMs = await this.#store.remainingCooldown(`erlc:provider:${connection.id}`, this.#now());
+      const providerRetryAfterMs = Math.max(
+        await this.#store.remainingCooldown("erlc:provider:global", this.#now()),
+        await this.#store.remainingCooldown(`erlc:provider:${connection.id}`, this.#now()));
       if (providerRetryAfterMs > 0) {
         await this.#store.recordRuleExecution({ ...execution, status: "rateLimited",
           detail: { code: "rate_limited", retryAfterMs: providerRetryAfterMs }, completedAt: new Date(this.#now()).toISOString() });
         return;
       }
-      const commandSlot = await this.#store.takeCooldown(`erlc:command:${connection.id}`,
+      const commandSlot = await this.#store.takeCooldown("erlc:command:global",
         RUNTIME_LIMITS.erlcCommandMinimumIntervalMs, this.#now());
       if (!commandSlot.allowed) {
         await this.#store.recordRuleExecution({ ...execution, status: "rateLimited",
@@ -242,16 +256,23 @@ export class RuleEngine {
       const outcome = await this.#sendCommand(serverKey, command);
       if (!outcome.success) {
         if (outcome.status === 429) {
-          await this.#store.setCooldown(`erlc:provider:${connection.id}`,
+          await this.#store.setCooldown("erlc:provider:global",
             outcome.retryAfterMs ?? RUNTIME_LIMITS.erlcCommandMinimumIntervalMs, this.#now());
         }
-        if (outcome.status === 401 || outcome.status === 403) {
+        if (outcome.providerCode === 2003 || outcome.providerCode === 2005) {
+          await this.#store.setCooldown("erlc:provider:global", 60 * 60_000, this.#now());
+        }
+        if ([400, 401, 403].includes(outcome.status ?? 0) &&
+          (outcome.providerCode === 2001 || outcome.providerCode === 2002 || outcome.providerCode === 2004)) {
           const { encryptedServerKey: _encrypted, serverKeyFingerprint: _fingerprint, ...withoutCredential } = connection;
           await this.#store.updateConnection({ ...withoutCredential, updatedAt: new Date(this.#now()).toISOString() });
           outcome.credentialDisabled = true;
         }
         if ([400, 404].includes(outcome.status ?? 0)) {
           await this.#store.setCooldown(`erlc:provider:${connection.id}`, 60_000, this.#now());
+        }
+        if (outcome.status === 401 || outcome.status === 403) {
+          await this.#store.setCooldown(`erlc:provider:${connection.id}`, 10 * 60_000, this.#now());
         }
         results.push({ type: action.type, ...outcome });
         const status = outcome.status === 429 ? "rateLimited" : outcome.uncertain ? "uncertain" : "failed";
@@ -274,10 +295,19 @@ export class RuleEngine {
     if (direct) return direct;
     const id = playerId(event);
     if (!id) return "";
+    if (Math.max(
+      await this.#store.remainingCooldown("erlc:provider:global", this.#now()),
+      await this.#store.remainingCooldown(`erlc:provider:${event.connectionId}`, this.#now())) > 0) return "";
     try {
       const response = await this.#fetch(`${this.#config.erlcApiBaseUrl}/server?Players=true`, {
-        headers: { "server-key": serverKey }
+        headers: erlcHeaders(this.#config, serverKey)
       });
+      if (response.status === 429) {
+        await this.#store.setCooldown("erlc:provider:global", erlcRetryAfterMs(response, this.#now()), this.#now());
+      }
+      if (response.status === 401 || response.status === 403) {
+        await this.#store.setCooldown(`erlc:provider:${event.connectionId}`, 10 * 60_000, this.#now());
+      }
       if (!response.ok) return "";
       const data = await response.json() as { Players?: Array<Record<string, unknown>> };
       for (const player of data.Players ?? []) {
@@ -299,7 +329,7 @@ export class RuleEngine {
     const timer = setTimeout(() => controller.abort(), this.#config.forwardTimeoutMs);
     try {
       const response = await this.#fetch(`${this.#config.erlcApiBaseUrl}/server/command`, {
-        method: "POST", headers: { "content-type": "application/json", "server-key": serverKey },
+        method: "POST", headers: { "content-type": "application/json", ...erlcHeaders(this.#config, serverKey) },
         body: JSON.stringify({ command }), signal: controller.signal
       });
       if (response.ok) return { success: true, status: response.status };
@@ -316,13 +346,7 @@ export class RuleEngine {
         }
       } catch {}
       if (response.status === 429) {
-        const retryAfter = response.headers.get("retry-after");
-        if (retryAfter) {
-          const seconds = Number(retryAfter);
-          const dateMs = Date.parse(retryAfter);
-          if (Number.isFinite(seconds)) retryAfterMs = Math.max(0, seconds * 1000);
-          else if (Number.isFinite(dateMs)) retryAfterMs = Math.max(0, dateMs - this.#now());
-        }
+        retryAfterMs = erlcRetryAfterMs(response, this.#now());
       }
       return {
         success: false,

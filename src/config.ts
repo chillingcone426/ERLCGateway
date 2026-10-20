@@ -40,6 +40,7 @@ export interface GatewayConfig {
   forwardRetryWindowMs: number;
   workerPollMs: number;
   erlcApiBaseUrl: string;
+  erlcGlobalApiKey?: string;
   eventRetentionDays: number;
   auditRetentionDays: number;
   maintenanceIntervalMs: number;
@@ -63,6 +64,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     forwardRetryWindowMs: integer(env.FORWARD_RETRY_WINDOW_MS, 15 * 60_000, "FORWARD_RETRY_WINDOW_MS"),
     workerPollMs: integer(env.WORKER_POLL_MS, 500, "WORKER_POLL_MS"),
     erlcApiBaseUrl: (env.ERLC_API_BASE_URL ?? "https://api.erlc.gg/v2").replace(/\/$/, ""),
+    ...(env.ERLC_GLOBAL_API_KEY?.trim() ? { erlcGlobalApiKey: env.ERLC_GLOBAL_API_KEY.trim() } : {}),
     eventRetentionDays: integer(env.EVENT_RETENTION_DAYS, 14, "EVENT_RETENTION_DAYS"),
     auditRetentionDays: integer(env.AUDIT_RETENTION_DAYS, 90, "AUDIT_RETENTION_DAYS"),
     maintenanceIntervalMs: integer(env.MAINTENANCE_INTERVAL_MS, 60 * 60_000, "MAINTENANCE_INTERVAL_MS"),

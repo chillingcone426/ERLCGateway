@@ -12,7 +12,7 @@ function setup() {
     managementApiToken: "management-test", erlcPublicKeySpkiBase64: publicKey.export({ format: "der", type: "spki" }).toString("base64"),
     webhookMaxClockSkewSeconds: 300, encryptionKey: crypto.randomBytes(32), forwardTimeoutMs: 1000,
     forwardMaxAttempts: 5, forwardRetryWindowMs: 900_000, workerPollMs: 100,
-    erlcApiBaseUrl: "https://api.erlc.test/v2", eventRetentionDays: 14, auditRetentionDays: 90, maintenanceIntervalMs: 3_600_000,
+    erlcApiBaseUrl: "https://api.erlc.test/v2", erlcGlobalApiKey: "public-app-test-key", eventRetentionDays: 14, auditRetentionDays: 90, maintenanceIntervalMs: 3_600_000,
     hostedCommandsEnabled: true
   };
   const store = new MemoryGatewayStore();
@@ -33,6 +33,31 @@ async function createConnection(app: Awaited<ReturnType<typeof createApp>>["app"
   assert.equal(response.statusCode, 201, response.body);
   return response.json().connection as { id: string; publicId: string; ingestUrl: string };
 }
+
+test("server key validation uses the public app key and fails closed when it is missing", async () => {
+  const value = setup();
+  const requests: Headers[] = [];
+  const fetchMock: typeof fetch = async (_input, init) => {
+    requests.push(new Headers(init?.headers));
+    return new Response(JSON.stringify({ Name: "Main" }), { status: 200 });
+  };
+  const { app } = await createApp({ config: value.config, store: value.store, fetch: fetchMock });
+  const connection = await createConnection(app, value.managementHeaders);
+  const url = `/v1/management/connections/${connection.id}/server-credential`;
+  const input = { serverKey: "server-key" };
+  delete value.config.erlcGlobalApiKey;
+  const missing = await app.inject({ method: "PUT", url, headers: value.managementHeaders, payload: input });
+  assert.equal(missing.statusCode, 503);
+  assert.equal(missing.json().error.code, "erlc_global_key_missing");
+  assert.equal(requests.length, 0);
+  value.config.erlcGlobalApiKey = "public-app-test-key";
+  const accepted = await app.inject({ method: "PUT", url, headers: value.managementHeaders, payload: input });
+  assert.equal(accepted.statusCode, 200);
+  assert.equal(requests[0]?.get("Authorization"), "public-app-test-key");
+  assert.equal(requests[0]?.get("Server-Key"), "server-key");
+  assert.doesNotMatch(accepted.body, /public-app-test-key|server-key/);
+  await app.close();
+});
 
 test("management endpoints enforce authentication, ownership, and connection limits", async () => {
   const value = setup();
@@ -307,9 +332,9 @@ test("hosted command executions retain ERLC rejection details for dashboard trou
   await ruleWorker.runOnce();
   assert.deepEqual(value.store.ruleExecutions[0]?.detail, {
     actions: [{ type: "privateReply", success: false, status: 403, code: "erlc_rejected", providerCode: 4000,
-      message: "Allowlist this server IP.", credentialDisabled: true }]
+      message: "Allowlist this server IP." }]
   });
-  assert.equal((await value.store.getConnection(connection.id))?.encryptedServerKey, undefined);
+  assert.ok((await value.store.getConnection(connection.id))?.encryptedServerKey);
   await app.close();
 });
 
@@ -372,7 +397,7 @@ test("hosted commands honor ERLC Retry-After without retrying the rejected comma
   assert.equal(value.store.ruleExecutions[0]?.status, "rateLimited");
   assert.equal((value.store.ruleExecutions[0]?.detail.actions as Array<Record<string, unknown>>)[0]?.retryAfterMs, 30_000);
   assert.equal(value.store.ruleExecutions[1]?.status, "rateLimited");
-  assert.ok((value.store.cooldowns.get(`erlc:provider:${connection.id}`) ?? 0) > Date.now() + 25_000);
+  assert.ok((value.store.cooldowns.get("erlc:provider:global") ?? 0) > Date.now() + 25_000);
   await app.close();
 });
 

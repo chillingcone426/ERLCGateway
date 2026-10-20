@@ -15,7 +15,7 @@ function fixture(action: "privateReply" | "announce", hostedCommandsEnabled = tr
     host: "127.0.0.1", port: 3000, baseUrl: "https://api.libertytools.test",
     managementApiToken: "test", erlcPublicKeySpkiBase64: "unused", webhookMaxClockSkewSeconds: 300,
     encryptionKey, forwardTimeoutMs: 1000, forwardMaxAttempts: 5, forwardRetryWindowMs: 900_000,
-    workerPollMs: 100, erlcApiBaseUrl: "https://api.erlc.test/v2", eventRetentionDays: 14,
+    workerPollMs: 100, erlcApiBaseUrl: "https://api.erlc.test/v2", erlcGlobalApiKey: "public-app-test-key", eventRetentionDays: 14,
     auditRetentionDays: 90, maintenanceIntervalMs: 3_600_000, hostedCommandsEnabled
   };
   const store = new MemoryGatewayStore();
@@ -59,6 +59,23 @@ test("the hosted-command emergency switch prevents outbound requests", async () 
   assert.equal(requests, 0);
   assert.equal(value.store.ruleExecutions[0]?.status, "skipped");
   assert.equal(value.store.ruleExecutions[0]?.detail.code, "hosted_commands_disabled");
+});
+
+test("hosted commands require the public app key and send both ER:LC credentials", async () => {
+  const value = fixture("privateReply");
+  const headers: Headers[] = [];
+  const engine = new RuleEngine({ store: value.store, config: value.config, now: value.now,
+    fetch: async (_input, init) => { headers.push(new Headers(init?.headers)); return new Response(null, { status: 200 }); } });
+  await value.store.createConnection(value.connection);
+  await value.store.createRule(value.rule);
+  await engine.executeRule(value.rule, value.event("evt_1"));
+  assert.equal(headers[0]?.get("Authorization"), "public-app-test-key");
+  assert.equal(headers[0]?.get("Server-Key"), "server-key");
+  delete value.config.erlcGlobalApiKey;
+  value.advance(RUNTIME_LIMITS.erlcCommandMinimumIntervalMs + 1);
+  await engine.executeRule(value.rule, value.event("evt_2"));
+  assert.equal(headers.length, 1);
+  assert.equal(value.store.ruleExecutions[1]?.detail.code, "erlc_global_key_missing");
 });
 
 test("server-wide announcements are limited to one per minute", async () => {

@@ -1,6 +1,7 @@
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import rawBody from "fastify-raw-body";
 import type { GatewayConfig } from "./config.js";
+import { erlcHeaders, erlcRetryAfterMs } from "./erlc.js";
 import { enqueueEventDeliveries, ForwardingWorker, legacyEasyEvent } from "./forwarding.js";
 import { DEFAULT_LIMITS, RUNTIME_LIMITS } from "./limits.js";
 import { decodeCursor, normalizeWebhookEvent, normalizeWebhookEvents } from "./normalization.js";
@@ -259,8 +260,23 @@ export async function createApp(options: CreateAppOptions) {
   app.put<{ Params: { id: string } }>("/v1/management/connections/:id/server-credential", async request => {
     const connection = await ownedConnection(store, request.params.id, accountId(request));
     const serverKey = string(body(request).serverKey, "serverKey", 500);
-    const response = await fetcher(`${config.erlcApiBaseUrl}/server`, { headers: { "server-key": serverKey } });
-    if (!response.ok) throw new ApiError(400, "credential_invalid", "ER:LC rejected the server key.");
+    if (!config.erlcGlobalApiKey) throw new ApiError(503, "erlc_global_key_missing", "LibertyTools has not configured its ER:LC public application key.");
+    const pausedMs = await store.remainingCooldown("erlc:provider:global");
+    if (pausedMs > 0) throw new ApiError(429, "rate_limited", "ER:LC requests are temporarily paused.", { retryAfterMs: pausedMs });
+    const response = await fetcher(`${config.erlcApiBaseUrl}/server`, { headers: erlcHeaders(config, serverKey) });
+    if (response.status === 429) {
+      const retryAfterMs = erlcRetryAfterMs(response);
+      await store.setCooldown("erlc:provider:global", retryAfterMs);
+      throw new ApiError(429, "rate_limited", "ER:LC requests are temporarily paused.", { retryAfterMs });
+    }
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({})) as { code?: unknown } | null;
+      if (error?.code === 2003 || error?.code === 2005) {
+        await store.setCooldown("erlc:provider:global", 60 * 60_000);
+        throw new ApiError(503, "erlc_global_key_invalid", "LibertyTools' ER:LC public application key was rejected.");
+      }
+      throw new ApiError(400, "credential_invalid", "ER:LC rejected the server key.");
+    }
     const data = await response.json() as Record<string, unknown>;
     const updated: Connection = {
       ...connection,
