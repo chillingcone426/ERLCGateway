@@ -34,23 +34,38 @@ function normalizeType(value: string | undefined) {
     : { type: "Unknown", originalType: value };
 }
 
-export function normalizeWebhookEvent(options: {
+function timestamp(value: unknown, fallback: string) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return new Date(value > 10_000_000_000 ? value : value * 1000).toISOString();
+  }
+  if (typeof value === "string" && value.trim()) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) return timestamp(numeric, fallback);
+    const parsed = new Date(value);
+    if (Number.isFinite(parsed.valueOf())) return parsed.toISOString();
+  }
+  return fallback;
+}
+
+export interface NormalizeWebhookOptions {
   connectionId: string;
   rawBody: Buffer;
   payload: unknown;
   headers: Record<string, string>;
   receivedAt?: string;
   synthetic?: boolean;
-}): GatewayEvent {
-  const input = record(options.payload);
+}
+
+function normalizeOne(options: NormalizeWebhookOptions, payload: unknown, envelope: Record<string, unknown>, batchIndex?: number): GatewayEvent {
+  const input = record(payload);
   const nested = record(input.data);
   const eventName = stringValue(input.event, input.type, nested.event, nested.type);
   const normalizedType = normalizeType(eventName);
   const receivedAt = options.receivedAt ?? new Date().toISOString();
-  const occurredAt = stringValue(input.timestamp, nested.timestamp) ?? receivedAt;
+  const occurredAt = timestamp(input.timestamp ?? nested.timestamp, receivedAt);
   const data: Record<string, unknown> = normalizedType.type === "CustomCommand"
     ? {
-        userId: stringValue(input.userId, input.userID, nested.userId, nested.userID) ?? "",
+        userId: stringValue(input.origin, input.userId, input.userID, nested.userId, nested.userID) ?? "",
         ...(stringValue(input.username, input.playerName, nested.username, nested.playerName)
           ? { username: stringValue(input.username, input.playerName, nested.username, nested.playerName)! }
           : {}),
@@ -62,7 +77,9 @@ export function normalizeWebhookEvent(options: {
     .update(options.connectionId)
     .update("\0")
     .update(options.rawBody)
+    .update(batchIndex === undefined ? "" : `\0batch:${batchIndex}`)
     .digest("hex");
+  const envelopeServer = record(envelope.server);
   return {
     id: randomId("evt"),
     connectionId: options.connectionId,
@@ -70,8 +87,8 @@ export function normalizeWebhookEvent(options: {
     ...(normalizedType.originalType ? { originalType: normalizedType.originalType } : {}),
     occurredAt,
     receivedAt,
-    ...(stringValue(input.serverId, input.server, nested.serverId, nested.server)
-      ? { serverId: stringValue(input.serverId, input.server, nested.serverId, nested.server)! }
+    ...(stringValue(input.serverId, input.server, nested.serverId, nested.server, envelope.server, envelopeServer.id)
+      ? { serverId: stringValue(input.serverId, input.server, nested.serverId, nested.server, envelope.server, envelopeServer.id)! }
       : {}),
     data,
     rawBody: options.rawBody,
@@ -79,6 +96,19 @@ export function normalizeWebhookEvent(options: {
     synthetic: options.synthetic ?? false,
     dedupeKey
   };
+}
+
+export function normalizeWebhookEvents(options: NormalizeWebhookOptions): GatewayEvent[] {
+  const envelope = record(options.payload);
+  const batch = Array.isArray(envelope.events)
+    ? envelope.events.filter(value => value && typeof value === "object" && !Array.isArray(value))
+    : [];
+  if (!batch.length) return [normalizeOne(options, options.payload, envelope)];
+  return batch.map((payload, index) => normalizeOne(options, payload, envelope, index));
+}
+
+export function normalizeWebhookEvent(options: NormalizeWebhookOptions): GatewayEvent {
+  return normalizeWebhookEvents(options)[0]!;
 }
 
 export function encodeCursor(event: GatewayEvent) {

@@ -3,7 +3,7 @@ import rawBody from "fastify-raw-body";
 import type { GatewayConfig } from "./config.js";
 import { enqueueEventDeliveries, ForwardingWorker, legacyEasyEvent } from "./forwarding.js";
 import { DEFAULT_LIMITS, RUNTIME_LIMITS } from "./limits.js";
-import { decodeCursor, normalizeWebhookEvent } from "./normalization.js";
+import { decodeCursor, normalizeWebhookEvent, normalizeWebhookEvents } from "./normalization.js";
 import { MaintenanceWorker } from "./maintenance.js";
 import { RuleEngine, RuleWorker, normalizeCommand, validateRuleDefinition } from "./rules.js";
 import {
@@ -650,14 +650,25 @@ export async function createApp(options: CreateAppOptions) {
     const headers = Object.fromEntries(Object.entries(request.headers)
       .filter((entry): entry is [string, string] => typeof entry[1] === "string")
       .map(([key, value]) => [key.toLowerCase(), value]));
-    const event = normalizeWebhookEvent({ connectionId: connection.id, rawBody: raw, payload: request.body, headers });
-    const saved = await store.saveEvent(event);
-    if (saved.inserted) {
-      const matchingRules = await ruleEngine.matchingRules(saved.event);
-      await enqueueEventDeliveries(store, saved.event, matchingRules.length > 0);
-      await ruleEngine.enqueue(saved.event, matchingRules);
+    const events = normalizeWebhookEvents({ connectionId: connection.id, rawBody: raw, payload: request.body, headers });
+    const savedEvents: GatewayEvent[] = [];
+    let inserted = 0;
+    for (const [index, event] of events.entries()) {
+      const saved = await store.saveEvent(event);
+      savedEvents.push(saved.event);
+      if (saved.inserted) {
+        inserted += 1;
+        const matchingRules = await ruleEngine.matchingRules(saved.event);
+        await enqueueEventDeliveries(store, saved.event, matchingRules.length > 0, new Date().toISOString(), { rawBatchPrimary: index === 0 });
+        await ruleEngine.enqueue(saved.event, matchingRules);
+      }
     }
-    return reply.code(202).send({ accepted: true, eventId: saved.event.id, duplicate: !saved.inserted });
+    return reply.code(202).send({
+      accepted: true,
+      eventId: savedEvents[0]?.id,
+      eventIds: savedEvents.map(event => event.id),
+      duplicate: inserted === 0
+    });
   };
   app.post<{ Params: { publicId: string } }>("/v1/ingest/:publicId", ingestHandler);
   app.post<{ Params: { publicId: string } }>("/webhook/:publicId", ingestHandler);

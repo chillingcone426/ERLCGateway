@@ -59,6 +59,25 @@ test("raw mirror preserves exact body and official signature headers", async () 
   assert.equal((await value.store.getDestination(destination.id))?.healthState, "active");
 });
 
+test("a raw batch is mirrored once while normalized events remain separate", async () => {
+  const value = fixture();
+  await value.store.createConnection(value.connection);
+  await value.store.saveEvent(value.event);
+  const destination: ForwardDestination = {
+    id: "dst_batch", connectionId: value.connection.id, name: "Batch mirror", type: "rawMirror",
+    url: "https://8.8.8.8/events", healthState: "probation", enabled: true,
+    transportSecurity: "encrypted", consecutiveFailures: 0, successfulDeliveries: 0,
+    filter: { eventTypes: ["*"], commandPolicy: "all", includedCommands: [], excludedCommands: [] },
+    createdAt: value.now, updatedAt: value.now
+  };
+  await value.store.createDestination(destination);
+  const skipped = await enqueueEventDeliveries(value.store, value.event, false, value.now, { rawBatchPrimary: false });
+  assert.equal(skipped.enqueued.length, 0);
+  assert.equal(skipped.skipped[0]?.reason, "raw_batch_already_forwarded");
+  await enqueueEventDeliveries(value.store, value.event, false, value.now, { rawBatchPrimary: true });
+  assert.equal(value.store.deliveries.size, 1);
+});
+
 test("signed proxy uses the decrypted secret and normalized body", async () => {
   const value = fixture();
   await value.store.createConnection(value.connection);

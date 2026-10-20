@@ -87,6 +87,41 @@ test("signed ingestion deduplicates and Poll subscriptions acknowledge independe
   await app.close();
 });
 
+test("ER:LC batch envelopes become typed Poll events", async () => {
+  const value = setup();
+  const { app } = await createApp({ config: value.config, store: value.store });
+  const connection = await createConnection(app, value.managementHeaders);
+  const subscriptionResponse = await app.inject({
+    method: "POST", url: `/v1/management/connections/${connection.id}/poll-subscriptions`,
+    headers: value.managementHeaders, payload: { name: "Batch reader" }
+  });
+  const subscription = subscriptionResponse.json() as { subscription: { id: string }; pollToken: string };
+  const payload = JSON.stringify({
+    server: "server-123",
+    events: [
+      { event: "CustomCommand", origin: "42", timestamp: 1711281000, data: { command: "help", argument: "" } },
+      { event: "WebhookProbe", origin: "global", timestamp: 1711281001, data: {} }
+    ]
+  });
+  const ingest = await app.inject({ method: "POST", url: `/v1/ingest/${connection.publicId}`, headers: value.sign(payload), payload });
+  assert.equal(ingest.statusCode, 202, ingest.body);
+  assert.equal(ingest.json().eventIds.length, 2);
+
+  const listed = await app.inject({
+    method: "GET", url: `/v1/poll/subscriptions/${subscription.subscription.id}/events`,
+    headers: { authorization: `Bearer ${subscription.pollToken}` }
+  });
+  const events = listed.json().events as Array<{ type: string; occurredAt: string; serverId: string; data: Record<string, unknown> }>;
+  assert.equal(events.length, 2);
+  const command = events.find(event => event.type === "CustomCommand");
+  assert.equal(command?.data.command, "help");
+  assert.equal(command?.data.userId, "42");
+  assert.equal(command?.occurredAt, "2024-03-24T11:50:00.000Z");
+  assert.equal(command?.serverId, "server-123");
+  assert.ok(events.some(event => event.type === "WebhookProbe"));
+  await app.close();
+});
+
 test("rejects invalid webhook signatures without storing an event", async () => {
   const value = setup();
   const { app } = await createApp({ config: value.config, store: value.store });

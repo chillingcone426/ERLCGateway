@@ -66,12 +66,17 @@ export async function enqueueEventDeliveries(
   store: GatewayStore,
   event: GatewayEvent,
   hostedMatched: boolean,
-  now = new Date().toISOString()
+  now = new Date().toISOString(),
+  options: { rawBatchPrimary?: boolean } = {}
 ) {
   const destinations = await store.listDestinations(event.connectionId);
   const enqueued: string[] = [];
   const skipped: Array<{ destinationId: string; reason: string }> = [];
   for (const destination of destinations) {
+    if (options.rawBatchPrimary === false && (destination.type === "rawMirror" || destination.type === "legacyEasy")) {
+      skipped.push({ destinationId: destination.id, reason: "raw_batch_already_forwarded" });
+      continue;
+    }
     if (!destination.enabled || destination.healthState === "paused" || destination.healthState === "blocked") {
       skipped.push({ destinationId: destination.id, reason: "destination_inactive" });
       continue;
