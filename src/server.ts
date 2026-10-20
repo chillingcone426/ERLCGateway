@@ -178,7 +178,9 @@ export async function createApp(options: CreateAppOptions) {
     } catch (error) { request.log.error({ err: error }, "audit write failed"); }
   });
 
-  app.get("/health/live", async () => ({ status: "ok", service: "libertytools-gateway" }));
+  const liveHealth = async () => ({ status: "ok", service: "libertytools-gateway" });
+  app.get("/health", liveHealth);
+  app.get("/health/live", liveHealth);
   app.get("/health/ready", async (_request, reply) => {
     try {
       await store.listConnections("__healthcheck__");

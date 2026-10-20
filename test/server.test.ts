@@ -36,6 +36,9 @@ async function createConnection(app: Awaited<ReturnType<typeof createApp>>["app"
 test("management endpoints enforce authentication, ownership, and connection limits", async () => {
   const value = setup();
   const { app } = await createApp({ config: value.config, store: value.store });
+  const legacyHealth = await app.inject({ method: "GET", url: "/health" });
+  assert.equal(legacyHealth.statusCode, 200);
+  assert.deepEqual(legacyHealth.json(), { status: "ok", service: "libertytools-gateway" });
   assert.equal((await app.inject({ method: "GET", url: "/v1/management/connections" })).statusCode, 401);
   const first = await createConnection(app, value.managementHeaders, "One");
   await createConnection(app, value.managementHeaders, "Two");
