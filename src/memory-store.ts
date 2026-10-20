@@ -10,6 +10,7 @@ import type {
   ForwardDestination,
   GatewayEvent,
   PollSubscription,
+  ProviderRequestSample,
   Rule,
   RuleRevision,
   RuleExecution,
@@ -42,9 +43,11 @@ export class MemoryGatewayStore implements GatewayStore {
   readonly limiter = new FixedWindowLimiter();
   readonly cooldowns = new Map<string, number>();
   readonly auditEntries: AuditEntry[] = [];
+  readonly providerRequests: ProviderRequestSample[] = [];
 
   async init() {}
   async close() {}
+  async recordProviderRequest(sample: ProviderRequestSample) { this.providerRequests.push(sample); }
 
   async createConnection(connection: Connection) { this.connections.set(connection.id, connection); }
   async listConnections(accountId: string) {

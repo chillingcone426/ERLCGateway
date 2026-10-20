@@ -6,6 +6,7 @@ import { enqueueEventDeliveries, ForwardingWorker, legacyEasyEvent } from "./for
 import { DEFAULT_LIMITS, RUNTIME_LIMITS } from "./limits.js";
 import { decodeCursor, normalizeWebhookEvent, normalizeWebhookEvents } from "./normalization.js";
 import { MaintenanceWorker } from "./maintenance.js";
+import { monitorErlcFetch } from "./provider-telemetry.js";
 import { RuleEngine, RuleWorker, normalizeCommand, validateRuleDefinition } from "./rules.js";
 import {
   constantTimeEqual,
@@ -148,11 +149,12 @@ async function ownedConnection(store: GatewayStore, id: string, owner: string) {
 export async function createApp(options: CreateAppOptions) {
   const { config, store } = options;
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: RUNTIME_LIMITS.maxInboundBytes });
+  const fetcher = monitorErlcFetch(options.fetch ?? globalThis.fetch, store, config,
+    () => app.log.error("ER:LC telemetry write failed"));
   const worker = options.worker ?? new ForwardingWorker({ store, config });
-  const ruleEngine = options.ruleEngine ?? new RuleEngine({ store, config, ...(options.fetch ? { fetch: options.fetch } : {}) });
+  const ruleEngine = options.ruleEngine ?? new RuleEngine({ store, config, fetch: fetcher });
   const ruleWorker = options.ruleWorker ?? new RuleWorker({ store, engine: ruleEngine, pollMs: config.workerPollMs });
   const maintenanceWorker = options.maintenanceWorker ?? new MaintenanceWorker({ store, config });
-  const fetcher = options.fetch ?? globalThis.fetch;
 
   await app.register(rawBody, { field: "rawBody", global: false, encoding: false,
     routes: ["/v1/ingest/:publicId", "/webhook/:publicId", "/webhook/erlc/:publicId"] });
@@ -268,11 +270,16 @@ export async function createApp(options: CreateAppOptions) {
   });
 
   app.put<{ Params: { id: string } }>("/v1/management/connections/:id/server-credential", async request => {
-    const connection = await ownedConnection(store, request.params.id, accountId(request));
+    const owner = accountId(request);
+    const connection = await ownedConnection(store, request.params.id, owner);
     const serverKey = string(body(request).serverKey, "serverKey", 500);
     if (!config.erlcGlobalApiKey) throw new ApiError(503, "erlc_global_key_missing", "LibertyTools has not configured its ER:LC public application key.");
     const pausedMs = await store.remainingCooldown("erlc:provider:global");
     if (pausedMs > 0) throw new ApiError(429, "rate_limited", "ER:LC requests are temporarily paused.", { retryAfterMs: pausedMs });
+    const accountLimit = await store.takeRateLimit(`erlc:credential-validation:${owner}`, 6, 60 * 60_000);
+    if (!accountLimit.allowed) throw new ApiError(429, "rate_limited", "Too many server-key checks. Try again later.", { retryAfterMs: accountLimit.retryAfterMs });
+    const appLimit = await store.takeRateLimit("erlc:credential-validation:global", 20, 60_000);
+    if (!appLimit.allowed) throw new ApiError(429, "rate_limited", "Server-key checks are temporarily busy.", { retryAfterMs: appLimit.retryAfterMs });
     const response = await fetcher(`${config.erlcApiBaseUrl}/server`, { headers: erlcHeaders(config, serverKey) });
     if (response.status === 429) {
       const retryAfterMs = erlcRetryAfterMs(response);

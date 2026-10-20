@@ -82,6 +82,25 @@ test("existing encrypted server keys provide the authorization server ID without
   await app.close();
 });
 
+test("server-key validation stops repeated provider requests from one account", async () => {
+  const value = setup();
+  let requests = 0;
+  const fetchMock: typeof fetch = async () => { requests++; return new Response("{}", { status: 400 }); };
+  const { app } = await createApp({ config: value.config, store: value.store, fetch: fetchMock });
+  const connection = await createConnection(app, value.managementHeaders);
+  const url = `/v1/management/connections/${connection.id}/server-credential`;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const response = await app.inject({ method: "PUT", url, headers: value.managementHeaders,
+      payload: { serverKey: "invalid-PublicServerId" } });
+    assert.equal(response.statusCode, 400);
+  }
+  const blocked = await app.inject({ method: "PUT", url, headers: value.managementHeaders,
+    payload: { serverKey: "invalid-PublicServerId" } });
+  assert.equal(blocked.statusCode, 429);
+  assert.equal(requests, 6);
+  await app.close();
+});
+
 test("management endpoints enforce authentication, ownership, and connection limits", async () => {
   const value = setup();
   const { app } = await createApp({ config: value.config, store: value.store });

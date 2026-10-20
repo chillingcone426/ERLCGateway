@@ -124,6 +124,7 @@ export class RuleEngine {
   readonly #config: GatewayConfig;
   readonly #fetch: typeof globalThis.fetch;
   readonly #now: () => number;
+  readonly #playerNameCache = new Map<string, { username: string; expiresAt: number }>();
 
   constructor(options: RuleEngineOptions) {
     this.#store = options.store;
@@ -295,6 +296,10 @@ export class RuleEngine {
     if (direct) return direct;
     const id = playerId(event);
     if (!id) return "";
+    const cacheKey = `${event.connectionId}:${id}`;
+    const cached = this.#playerNameCache.get(cacheKey);
+    if (cached && cached.expiresAt > this.#now()) return cached.username;
+    if (cached) this.#playerNameCache.delete(cacheKey);
     if (Math.max(
       await this.#store.remainingCooldown("erlc:provider:global", this.#now()),
       await this.#store.remainingCooldown(`erlc:provider:${event.connectionId}`, this.#now())) > 0) return "";
@@ -316,7 +321,11 @@ export class RuleEngine {
           const separator = combined.lastIndexOf(":");
           if (combined.slice(separator + 1) === id) {
             const username = combined.slice(0, separator);
-            if (/^[A-Za-z0-9_]+$/.test(username)) return username;
+            if (/^[A-Za-z0-9_]+$/.test(username)) {
+              if (this.#playerNameCache.size >= 500) this.#playerNameCache.delete(this.#playerNameCache.keys().next().value!);
+              this.#playerNameCache.set(cacheKey, { username, expiresAt: this.#now() + 30_000 });
+              return username;
+            }
           }
         }
       }

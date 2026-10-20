@@ -14,6 +14,7 @@ import type {
   ForwardDestination,
   GatewayEvent,
   PollSubscription,
+  ProviderRequestSample,
   Rule,
   RuleRevision,
   RuleExecution,
@@ -103,6 +104,12 @@ export class PostgresGatewayStore implements GatewayStore {
     for (const file of files) await this.pool.query(await fs.readFile(path.join(directory, file), "utf8"));
   }
   async close() { await this.pool.end(); }
+  async recordProviderRequest(sample: ProviderRequestSample) {
+    await this.pool.query(`INSERT INTO provider_requests
+      (operation,status_code,latency_ms,rate_limit_bucket,rate_limit_limit,rate_limit_remaining,recorded_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7)`, [sample.operation, sample.statusCode ?? null, sample.latencyMs,
+      sample.rateLimitBucket ?? null, sample.rateLimitLimit ?? null, sample.rateLimitRemaining ?? null, sample.recordedAt]);
+  }
 
   async createConnection(value: Connection) {
     await this.pool.query(`INSERT INTO connections
@@ -446,6 +453,7 @@ export class PostgresGatewayStore implements GatewayStore {
   async cleanup(beforeEvents: string, beforeAudit: string) {
     const events = await this.pool.query("DELETE FROM events WHERE received_at < $1", [beforeEvents]);
     const audit = await this.pool.query("DELETE FROM audit_log WHERE created_at < $1", [beforeAudit]);
+    await this.pool.query("DELETE FROM provider_requests WHERE recorded_at < now() - interval '7 days'");
     return { events: events.rowCount ?? 0, audit: audit.rowCount ?? 0 };
   }
 }

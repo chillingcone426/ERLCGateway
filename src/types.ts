@@ -3,6 +3,16 @@ export type DestinationType = "signedProxy" | "rawMirror" | "legacyEasy";
 export type DestinationHealth = "probation" | "active" | "degraded" | "paused" | "blocked";
 export type CommandPolicy = "all" | "exclude" | "unmatchedHosted";
 
+export interface ProviderRequestSample {
+  operation: "server" | "players" | "command";
+  statusCode?: number;
+  latencyMs: number;
+  rateLimitBucket?: string;
+  rateLimitLimit?: number;
+  rateLimitRemaining?: number;
+  recordedAt: string;
+}
+
 export interface Connection {
   id: string;
   accountId: string;

@@ -8,6 +8,7 @@ import type {
   ForwardDestination,
   GatewayEvent,
   PollSubscription,
+  ProviderRequestSample,
   Rule,
   RuleRevision,
   RuleExecution,
@@ -82,6 +83,7 @@ export interface GatewayStore {
   takeCooldown(key: string, durationMs: number, now?: number): Promise<{ allowed: boolean; retryAfterMs: number }>;
   remainingCooldown(key: string, now?: number): Promise<number>;
   setCooldown(key: string, durationMs: number, now?: number): Promise<void>;
+  recordProviderRequest(sample: ProviderRequestSample): Promise<void>;
   recordAudit(entry: AuditEntry): Promise<void>;
   listAudit(accountId: string, connectionId: string | undefined, limit: number): Promise<AuditEntry[]>;
   cleanup(beforeEvents: string, beforeAudit: string): Promise<{ events: number; audit: number }>;

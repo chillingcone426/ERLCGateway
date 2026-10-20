@@ -78,6 +78,29 @@ test("hosted commands require the public app key and send both ER:LC credentials
   assert.equal(value.store.ruleExecutions[1]?.detail.code, "erlc_global_key_missing");
 });
 
+test("repeated commands reuse a recent player lookup", async () => {
+  const value = fixture("privateReply");
+  let lookups = 0;
+  let commands = 0;
+  const engine = new RuleEngine({ store: value.store, config: value.config, now: value.now,
+    fetch: async (input) => {
+      if (String(input).includes("Players=true")) {
+        lookups++;
+        return new Response(JSON.stringify({ Players: [{ Player: "TestPlayer:123" }] }), { status: 200 });
+      }
+      commands++;
+      return new Response(null, { status: 200 });
+    } });
+  await value.store.createConnection(value.connection);
+  await value.store.createRule(value.rule);
+  const first = { ...value.event("evt_1"), data: { command: "help", userId: "123" } };
+  await engine.executeRule(value.rule, first);
+  value.advance(RUNTIME_LIMITS.erlcCommandMinimumIntervalMs + 1);
+  await engine.executeRule(value.rule, { ...first, id: "evt_2" });
+  assert.equal(lookups, 1);
+  assert.equal(commands, 2);
+});
+
 test("server-wide announcements are limited to one per minute", async () => {
   const value = fixture("announce");
   const commands: string[] = [];
