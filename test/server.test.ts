@@ -44,7 +44,7 @@ test("server key validation uses the public app key and fails closed when it is 
   const { app } = await createApp({ config: value.config, store: value.store, fetch: fetchMock });
   const connection = await createConnection(app, value.managementHeaders);
   const url = `/v1/management/connections/${connection.id}/server-credential`;
-  const input = { serverKey: "server-key" };
+  const input = { serverKey: "privatePart-PublicServerId" };
   delete value.config.erlcGlobalApiKey;
   const missing = await app.inject({ method: "PUT", url, headers: value.managementHeaders, payload: input });
   assert.equal(missing.statusCode, 503);
@@ -54,8 +54,9 @@ test("server key validation uses the public app key and fails closed when it is 
   const accepted = await app.inject({ method: "PUT", url, headers: value.managementHeaders, payload: input });
   assert.equal(accepted.statusCode, 200);
   assert.equal(requests[0]?.get("Authorization"), "public-app-test-key");
-  assert.equal(requests[0]?.get("Server-Key"), "server-key");
-  assert.doesNotMatch(accepted.body, /public-app-test-key|server-key/);
+  assert.equal(requests[0]?.get("Server-Key"), "privatePart-PublicServerId");
+  assert.equal(accepted.json().connection.server.id, "PublicServerId");
+  assert.doesNotMatch(accepted.body, /public-app-test-key|privatePart/);
   await app.close();
 });
 

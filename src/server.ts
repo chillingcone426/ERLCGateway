@@ -1,7 +1,7 @@
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import rawBody from "fastify-raw-body";
 import type { GatewayConfig } from "./config.js";
-import { erlcHeaders, erlcRetryAfterMs } from "./erlc.js";
+import { erlcHeaders, erlcInternalServerId, erlcRetryAfterMs } from "./erlc.js";
 import { enqueueEventDeliveries, ForwardingWorker, legacyEasyEvent } from "./forwarding.js";
 import { DEFAULT_LIMITS, RUNTIME_LIMITS } from "./limits.js";
 import { decodeCursor, normalizeWebhookEvent, normalizeWebhookEvents } from "./normalization.js";
@@ -278,11 +278,13 @@ export async function createApp(options: CreateAppOptions) {
       throw new ApiError(400, "credential_invalid", "ER:LC rejected the server key.");
     }
     const data = await response.json() as Record<string, unknown>;
+    const internalServerId = erlcInternalServerId(serverKey);
     const updated: Connection = {
       ...connection,
       encryptedServerKey: encryptSecret(serverKey, config.encryptionKey),
       serverKeyFingerprint: secretFingerprint(serverKey),
-      ...(data.Id !== undefined ? { serverId: String(data.Id) } : {}),
+      ...(internalServerId ? { serverId: internalServerId } :
+        data.Id !== undefined ? { serverId: String(data.Id) } : {}),
       ...(typeof data.Name === "string" ? { serverName: data.Name } : {}),
       updatedAt: new Date().toISOString()
     };
