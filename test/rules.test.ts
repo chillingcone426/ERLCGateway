@@ -1,0 +1,178 @@
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import test from "node:test";
+import type { GatewayConfig } from "../src/config.js";
+import { RUNTIME_LIMITS } from "../src/limits.js";
+import { MemoryGatewayStore } from "../src/memory-store.js";
+import { RuleEngine, RuleWorker, validateRuleDefinition } from "../src/rules.js";
+import { encryptSecret } from "../src/security.js";
+import type { Connection, GatewayEvent, Rule } from "../src/types.js";
+
+function fixture(action: "privateReply" | "announce", hostedCommandsEnabled = true) {
+  let now = Date.parse("2026-10-20T12:00:00.000Z");
+  const encryptionKey = crypto.randomBytes(32);
+  const config: GatewayConfig = {
+    host: "127.0.0.1", port: 3000, baseUrl: "https://api.libertytools.test",
+    managementApiToken: "test", erlcPublicKeySpkiBase64: "unused", webhookMaxClockSkewSeconds: 300,
+    encryptionKey, forwardTimeoutMs: 1000, forwardMaxAttempts: 5, forwardRetryWindowMs: 900_000,
+    workerPollMs: 100, erlcApiBaseUrl: "https://api.erlc.test/v2", erlcGlobalApiKey: "public-app-test-key", eventRetentionDays: 14,
+    auditRetentionDays: 90, maintenanceIntervalMs: 3_600_000, hostedCommandsEnabled
+  };
+  const store = new MemoryGatewayStore();
+  const connection: Connection = {
+    id: "con_1", accountId: "acct_1", name: "Server", publicId: "pub_1", paused: false,
+    encryptedServerKey: encryptSecret("server-key", encryptionKey), createdAt: new Date(now).toISOString(),
+    updatedAt: new Date(now).toISOString()
+  };
+  const definition = {
+    trigger: { type: "customCommand" as const, command: "help" }, conditions: [],
+    actions: [{ type: action, message: "Hello" }]
+  };
+  const rule: Rule = {
+    id: "rul_1", connectionId: connection.id, name: "Help", enabled: true, draftVersion: 1,
+    draft: definition, activeRevision: 1, published: definition,
+    createdAt: new Date(now).toISOString(), updatedAt: new Date(now).toISOString()
+  };
+  const event = (id: string): GatewayEvent => ({
+    id, connectionId: connection.id, type: "CustomCommand", occurredAt: new Date(now).toISOString(),
+    receivedAt: new Date(now).toISOString(), data: { command: "help", username: "TestPlayer", userId: id },
+    rawBody: Buffer.from("{}"), originalHeaders: {}, synthetic: false, dedupeKey: id
+  });
+  return { config, store, connection, rule, event, now: () => now, advance: (ms: number) => { now += ms; } };
+}
+
+test("hosted actions only accept explicit custom-command triggers", () => {
+  assert.throws(() => validateRuleDefinition({
+    trigger: { type: "event", eventType: "PlayerJoined" }, conditions: [],
+    actions: [{ type: "announce", message: "Hello" }]
+  }), /require a custom command trigger/);
+});
+
+test("invalid rule conditions are rejected before publication", () => {
+  const base = { trigger: { type: "customCommand", command: "help" }, actions: [{ type: "announce", message: "Hello" }] };
+  for (const condition of [null, { field: "unknown", operator: "equals", value: "x" },
+    { field: "command.argument", operator: "contains" }, { field: "player.id", operator: "exists" }]) {
+    assert.throws(() => validateRuleDefinition({ ...base, conditions: [condition] }), /Rule condition is invalid/);
+  }
+});
+
+test("queued commands use the published revision that matched the event", async () => {
+  const value = fixture("announce");
+  const sent: string[] = [];
+  const engine = new RuleEngine({ store: value.store, config: value.config, now: value.now,
+    fetch: async (input, init) => {
+      if (String(input).includes("Players=true")) return new Response(JSON.stringify({ Players: [] }), { status: 200 });
+      sent.push(String(JSON.parse(String(init?.body)).command));
+      return new Response("{}", { status: 200 });
+    } });
+  await value.store.createConnection(value.connection);
+  await value.store.createRule(value.rule);
+  await value.store.createRuleRevision({ ruleId: value.rule.id, revision: 1,
+    definition: value.rule.published!, publishedAt: value.rule.createdAt });
+  const event = value.event("evt_revision");
+  await value.store.saveEvent(event);
+  await engine.enqueue(event, [value.rule]);
+  await value.store.updateRule({ ...value.rule, activeRevision: 2,
+    published: { ...value.rule.published!, actions: [{ type: "announce", message: "Changed" }] } });
+  const worker = new RuleWorker({ store: value.store, engine, pollMs: 100 });
+  await worker.runOnce();
+  assert.deepEqual(sent, [":h Hello"]);
+});
+
+test("an interrupted command is marked uncertain without sending it again", async () => {
+  const value = fixture("announce");
+  const event = value.event("evt_interrupted");
+  await value.store.saveEvent(event);
+  await value.store.enqueueRuleJob({ id: "rjb_1", ruleId: value.rule.id, eventId: event.id,
+    attempt: 0, state: "pending", availableAt: value.rule.createdAt, createdAt: value.rule.createdAt });
+  assert.equal((await value.store.claimRuleJobs(10, value.rule.createdAt)).length, 1);
+  const later = new Date(Date.parse(value.rule.createdAt) + 5 * 60_000).toISOString();
+  assert.equal((await value.store.claimRuleJobs(10, later)).length, 0);
+  assert.equal(value.store.ruleJobs.get("rjb_1")?.lastErrorCode, "worker_interrupted");
+  assert.equal(value.store.ruleExecutions[0]?.status, "uncertain");
+});
+
+test("the hosted-command emergency switch prevents outbound requests", async () => {
+  const value = fixture("privateReply", false);
+  let requests = 0;
+  const engine = new RuleEngine({ store: value.store, config: value.config, now: value.now,
+    fetch: async () => { requests += 1; return new Response(null, { status: 200 }); } });
+  await value.store.createConnection(value.connection);
+  await value.store.createRule(value.rule);
+  await engine.executeRule(value.rule, value.event("evt_1"));
+  assert.equal(requests, 0);
+  assert.equal(value.store.ruleExecutions[0]?.status, "skipped");
+  assert.equal(value.store.ruleExecutions[0]?.detail.code, "hosted_commands_disabled");
+});
+
+test("hosted commands require the public app key and send both ER:LC credentials", async () => {
+  const value = fixture("privateReply");
+  const headers: Headers[] = [];
+  const engine = new RuleEngine({ store: value.store, config: value.config, now: value.now,
+    fetch: async (_input, init) => { headers.push(new Headers(init?.headers)); return new Response(null, { status: 200 }); } });
+  await value.store.createConnection(value.connection);
+  await value.store.createRule(value.rule);
+  await engine.executeRule(value.rule, value.event("evt_1"));
+  assert.equal(headers[0]?.get("Authorization"), "public-app-test-key");
+  assert.equal(headers[0]?.get("Server-Key"), "server-key");
+  delete value.config.erlcGlobalApiKey;
+  value.advance(RUNTIME_LIMITS.erlcCommandMinimumIntervalMs + 1);
+  await engine.executeRule(value.rule, value.event("evt_2"));
+  assert.equal(headers.length, 1);
+  assert.equal(value.store.ruleExecutions[1]?.detail.code, "erlc_global_key_missing");
+});
+
+test("repeated commands reuse a recent player lookup", async () => {
+  const value = fixture("privateReply");
+  let lookups = 0;
+  let commands = 0;
+  const engine = new RuleEngine({ store: value.store, config: value.config, now: value.now,
+    fetch: async (input) => {
+      if (String(input).includes("Players=true")) {
+        lookups++;
+        return new Response(JSON.stringify({ Players: [{ Player: "TestPlayer:123" }] }), { status: 200 });
+      }
+      commands++;
+      return new Response(null, { status: 200 });
+    } });
+  await value.store.createConnection(value.connection);
+  await value.store.createRule(value.rule);
+  const first = { ...value.event("evt_1"), data: { command: "help", userId: "123" } };
+  await engine.executeRule(value.rule, first);
+  value.advance(RUNTIME_LIMITS.erlcCommandMinimumIntervalMs + 1);
+  await engine.executeRule(value.rule, { ...first, id: "evt_2" });
+  assert.equal(lookups, 1);
+  assert.equal(commands, 2);
+});
+
+test("server-wide announcements are limited to one per minute", async () => {
+  const value = fixture("announce");
+  const commands: string[] = [];
+  const engine = new RuleEngine({ store: value.store, config: value.config, now: value.now,
+    fetch: async (_input, init) => { commands.push(String(JSON.parse(String(init?.body)).command)); return new Response(null, { status: 200 }); } });
+  await value.store.createConnection(value.connection);
+  await value.store.createRule(value.rule);
+  await engine.executeRule(value.rule, value.event("evt_1"));
+  value.advance(RUNTIME_LIMITS.erlcCommandMinimumIntervalMs + 1);
+  await engine.executeRule(value.rule, value.event("evt_2"));
+  assert.deepEqual(commands, [":h Hello"]);
+  assert.equal(value.store.ruleExecutions[1]?.detail.code, "announcement_rate_limited");
+});
+
+test("daily safety limits disable the command before another request is sent", async () => {
+  const value = fixture("privateReply");
+  let requests = 0;
+  const engine = new RuleEngine({ store: value.store, config: value.config, now: value.now,
+    fetch: async () => { requests += 1; return new Response(null, { status: 200 }); } });
+  await value.store.createConnection(value.connection);
+  await value.store.createRule(value.rule);
+  for (let index = 0; index < RUNTIME_LIMITS.hostedActionsPerConnectionDay; index += 1) {
+    await value.store.takeRateLimit(`actions:connection:${value.connection.id}:day`,
+      RUNTIME_LIMITS.hostedActionsPerConnectionDay, 24 * 60 * 60_000, value.now());
+  }
+  await engine.executeRule(value.rule, value.event("evt_1"));
+  assert.equal(requests, 0);
+  assert.equal((await value.store.getRule(value.rule.id))?.enabled, false);
+  assert.equal(value.store.ruleExecutions[0]?.detail.code, "safety_limit_reached");
+  assert.equal(value.store.ruleExecutions[0]?.detail.circuitBreaker, true);
+});
