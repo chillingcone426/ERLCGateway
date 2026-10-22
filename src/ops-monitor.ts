@@ -27,6 +27,71 @@ export function providerAlerts(window: ProviderWindow) {
   return alerts;
 }
 
+// The monitor normally runs every five minutes. Require three matching observations
+// spanning at least ten minutes before announcing either side of a transition.
+export const HEALTH_CONFIRMATIONS = 3;
+export const HEALTH_CONFIRMATION_MS = 10 * 60_000;
+
+export interface AlertState {
+  status: "pending_down" | "down" | "pending_up";
+  firstObservedAt: number;
+  observations: number;
+}
+
+export function advanceAlertState(
+  previous: Record<string, AlertState>,
+  alerts: Record<string, string>,
+  now: number
+): { state: Record<string, AlertState>; notifications: string[] } {
+  const state: Record<string, AlertState> = {};
+  const notifications: string[] = [];
+  for (const code of new Set([...Object.keys(previous), ...Object.keys(alerts)])) {
+    const prior = previous[code];
+    const message = alerts[code];
+    if (message) {
+      if (!prior) {
+        state[code] = { status: "pending_down", firstObservedAt: now, observations: 1 };
+      } else if (prior.status === "down") {
+        state[code] = prior;
+      } else if (prior.status === "pending_up") {
+        state[code] = { status: "down", firstObservedAt: now, observations: 0 };
+      } else {
+        const observations = prior.observations + 1;
+        if (observations >= HEALTH_CONFIRMATIONS && now - prior.firstObservedAt >= HEALTH_CONFIRMATION_MS) {
+          state[code] = { status: "down", firstObservedAt: now, observations: 0 };
+          notifications.push(`⚠️ LibertyTools operator alert: ${message}`);
+        } else state[code] = { ...prior, observations };
+      }
+    } else if (prior?.status === "down") {
+      state[code] = { status: "pending_up", firstObservedAt: now, observations: 1 };
+    } else if (prior?.status === "pending_up") {
+      const observations = prior.observations + 1;
+      if (observations >= HEALTH_CONFIRMATIONS && now - prior.firstObservedAt >= HEALTH_CONFIRMATION_MS) {
+        notifications.push(`✅ LibertyTools recovered: ${code.replaceAll("_", " ")}.`);
+      } else state[code] = { ...prior, observations };
+    }
+  }
+  return { state, notifications };
+}
+
+export function parseAlertState(value: unknown): Record<string, AlertState> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const state: Record<string, AlertState> = {};
+  for (const [code, entry] of Object.entries(value)) {
+    // Older monitor versions recorded the last notification time as a number.
+    if (typeof entry === "number" && Number.isFinite(entry)) {
+      state[code] = { status: "down", firstObservedAt: entry, observations: 0 };
+    } else if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+      const candidate = entry as Partial<AlertState>;
+      if (["pending_down", "down", "pending_up"].includes(candidate.status ?? "") &&
+        typeof candidate.firstObservedAt === "number" && Number.isFinite(candidate.firstObservedAt) &&
+        typeof candidate.observations === "number" && Number.isInteger(candidate.observations) &&
+        candidate.observations >= 0) state[code] = candidate as AlertState;
+    }
+  }
+  return state;
+}
+
 async function serviceProblem(url: string, expectedStatus: number) {
   try {
     const response = await fetch(url, { signal: AbortSignal.timeout(5_000) });
@@ -74,26 +139,17 @@ async function monitor() {
   if (dashboardProblem) alerts.dashboard_health = `LibertyTools dashboard is ${dashboardProblem}.`;
   if (dryRun) { console.log(JSON.stringify({ window, alerts })); return; }
 
-  let previous: Record<string, number> = {};
+  let previous: Record<string, AlertState> = {};
   try {
     const parsed = JSON.parse(await fs.readFile(statePath!, "utf8")) as unknown;
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) previous = parsed as Record<string, number>;
+    previous = parseAlertState(parsed);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  const now = Date.now();
-  const next: Record<string, number> = {};
-  for (const [code, message] of Object.entries(alerts)) {
-    if (!previous[code] || now - previous[code] >= 60 * 60_000) {
-      await sendDiscord(webhookUrl!, `⚠️ LibertyTools operator alert: ${message}`);
-      next[code] = now;
-    } else next[code] = previous[code];
-  }
-  for (const code of Object.keys(previous)) {
-    if (!alerts[code]) await sendDiscord(webhookUrl!, `✅ LibertyTools recovered: ${code.replaceAll("_", " ")}.`);
-  }
+  const { state, notifications } = advanceAlertState(previous, alerts, Date.now());
+  for (const notification of notifications) await sendDiscord(webhookUrl!, notification);
   const temporary = `${statePath!}.tmp`;
-  await fs.writeFile(temporary, JSON.stringify(next), { mode: 0o600 });
+  await fs.writeFile(temporary, JSON.stringify(state), { mode: 0o600 });
   await fs.rename(temporary, statePath!);
 }
 
