@@ -175,6 +175,7 @@ export interface RuleJob {
   id: string;
   ruleId: string;
   eventId: string;
+  revision?: number;
   attempt: number;
   state: "pending" | "running" | "succeeded" | "failed" | "cancelled";
   availableAt: string;

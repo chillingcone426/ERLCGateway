@@ -1,5 +1,6 @@
 import { encodeCursor } from "./normalization.js";
 import { FixedWindowLimiter } from "./limits.js";
+import { randomId } from "./security.js";
 import type { EventQuery, GatewayStore } from "./store.js";
 import type {
   AuditEntry,
@@ -90,6 +91,14 @@ export class MemoryGatewayStore implements GatewayStore {
     this.eventByDedupe.set(event.dedupeKey, event.id);
     return { inserted: true, event };
   }
+  async saveEventWithJobs(event: GatewayEvent, deliveries: DeliveryJob[], rules: RuleJob[]) {
+    const saved = await this.saveEvent(event);
+    if (saved.inserted) {
+      for (const job of deliveries) await this.enqueueDelivery(job);
+      for (const job of rules) await this.enqueueRuleJob(job);
+    }
+    return saved;
+  }
   async getEvent(id: string) { return this.events.get(id); }
   async listEvents(connectionId: string, query: EventQuery) {
     const subscription = query.pendingForSubscriptionId
@@ -151,11 +160,12 @@ export class MemoryGatewayStore implements GatewayStore {
   }
   async claimDeliveries(limit: number, now: string): Promise<DeliveryJob[]> {
     const jobs = [...this.deliveries.values()]
-      .filter(value => value.state === "pending" && value.availableAt <= now)
+      .filter(value => (value.state === "pending" || value.state === "running") && value.availableAt <= now)
       .sort((a, b) => a.availableAt.localeCompare(b.availableAt))
       .slice(0, limit);
-    for (const job of jobs) this.deliveries.set(job.id, { ...job, state: "running" });
-    return jobs.map(job => ({ ...job, state: "running" as const }));
+    const leaseUntil = new Date(Date.parse(now) + 5 * 60_000).toISOString();
+    for (const job of jobs) this.deliveries.set(job.id, { ...job, state: "running", availableAt: leaseUntil });
+    return jobs.map(job => ({ ...job, state: "running" as const, availableAt: leaseUntil }));
   }
   async updateDelivery(job: DeliveryJob) { this.deliveries.set(job.id, job); }
   async recordDeliveryAttempt(attempt: DeliveryAttempt) { this.deliveryAttempts.push(attempt); }
@@ -201,10 +211,19 @@ export class MemoryGatewayStore implements GatewayStore {
     this.ruleJobs.set(job.id, job); return true;
   }
   async claimRuleJobs(limit: number, now: string) {
+    for (const job of this.ruleJobs.values()) {
+      if (job.state !== "running" || job.availableAt > now) continue;
+      this.ruleJobs.set(job.id, { ...job, state: "failed", lastErrorCode: "worker_interrupted" });
+      if (!this.ruleExecutions.some(value => value.ruleId === job.ruleId && value.eventId === job.eventId)) {
+        this.ruleExecutions.push({ id: randomId("exe"), ruleId: job.ruleId, eventId: job.eventId,
+          status: "uncertain", detail: { code: "worker_interrupted" }, createdAt: now, completedAt: now });
+      }
+    }
     const jobs = [...this.ruleJobs.values()].filter(value => value.state === "pending" && value.availableAt <= now)
       .sort((a, b) => a.availableAt.localeCompare(b.availableAt)).slice(0, limit);
-    for (const job of jobs) this.ruleJobs.set(job.id, { ...job, state: "running" });
-    return jobs.map(job => ({ ...job, state: "running" as const }));
+    const leaseUntil = new Date(Date.parse(now) + 5 * 60_000).toISOString();
+    for (const job of jobs) this.ruleJobs.set(job.id, { ...job, state: "running", availableAt: leaseUntil });
+    return jobs.map(job => ({ ...job, state: "running" as const, availableAt: leaseUntil }));
   }
   async updateRuleJob(job: RuleJob) { this.ruleJobs.set(job.id, job); }
 

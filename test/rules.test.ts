@@ -4,7 +4,7 @@ import test from "node:test";
 import type { GatewayConfig } from "../src/config.js";
 import { RUNTIME_LIMITS } from "../src/limits.js";
 import { MemoryGatewayStore } from "../src/memory-store.js";
-import { RuleEngine, validateRuleDefinition } from "../src/rules.js";
+import { RuleEngine, RuleWorker, validateRuleDefinition } from "../src/rules.js";
 import { encryptSecret } from "../src/security.js";
 import type { Connection, GatewayEvent, Rule } from "../src/types.js";
 
@@ -46,6 +46,50 @@ test("hosted actions only accept explicit custom-command triggers", () => {
     trigger: { type: "event", eventType: "PlayerJoined" }, conditions: [],
     actions: [{ type: "announce", message: "Hello" }]
   }), /require a custom command trigger/);
+});
+
+test("invalid rule conditions are rejected before publication", () => {
+  const base = { trigger: { type: "customCommand", command: "help" }, actions: [{ type: "announce", message: "Hello" }] };
+  for (const condition of [null, { field: "unknown", operator: "equals", value: "x" },
+    { field: "command.argument", operator: "contains" }, { field: "player.id", operator: "exists" }]) {
+    assert.throws(() => validateRuleDefinition({ ...base, conditions: [condition] }), /Rule condition is invalid/);
+  }
+});
+
+test("queued commands use the published revision that matched the event", async () => {
+  const value = fixture("announce");
+  const sent: string[] = [];
+  const engine = new RuleEngine({ store: value.store, config: value.config, now: value.now,
+    fetch: async (input, init) => {
+      if (String(input).includes("Players=true")) return new Response(JSON.stringify({ Players: [] }), { status: 200 });
+      sent.push(String(JSON.parse(String(init?.body)).command));
+      return new Response("{}", { status: 200 });
+    } });
+  await value.store.createConnection(value.connection);
+  await value.store.createRule(value.rule);
+  await value.store.createRuleRevision({ ruleId: value.rule.id, revision: 1,
+    definition: value.rule.published!, publishedAt: value.rule.createdAt });
+  const event = value.event("evt_revision");
+  await value.store.saveEvent(event);
+  await engine.enqueue(event, [value.rule]);
+  await value.store.updateRule({ ...value.rule, activeRevision: 2,
+    published: { ...value.rule.published!, actions: [{ type: "announce", message: "Changed" }] } });
+  const worker = new RuleWorker({ store: value.store, engine, pollMs: 100 });
+  await worker.runOnce();
+  assert.deepEqual(sent, [":h Hello"]);
+});
+
+test("an interrupted command is marked uncertain without sending it again", async () => {
+  const value = fixture("announce");
+  const event = value.event("evt_interrupted");
+  await value.store.saveEvent(event);
+  await value.store.enqueueRuleJob({ id: "rjb_1", ruleId: value.rule.id, eventId: event.id,
+    attempt: 0, state: "pending", availableAt: value.rule.createdAt, createdAt: value.rule.createdAt });
+  assert.equal((await value.store.claimRuleJobs(10, value.rule.createdAt)).length, 1);
+  const later = new Date(Date.parse(value.rule.createdAt) + 5 * 60_000).toISOString();
+  assert.equal((await value.store.claimRuleJobs(10, later)).length, 0);
+  assert.equal(value.store.ruleJobs.get("rjb_1")?.lastErrorCode, "worker_interrupted");
+  assert.equal(value.store.ruleExecutions[0]?.status, "uncertain");
 });
 
 test("the hosted-command emergency switch prevents outbound requests", async () => {

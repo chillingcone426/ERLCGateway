@@ -17,6 +17,7 @@ Migrations in `migrations/` run in filename order when the service starts. The s
 - Signed Proxy requests include `x-liberty-timestamp` and `x-liberty-signature`. Raw Mirror requests preserve the original ER:LC body and signature headers.
 - New destinations begin in probation. Any successful 2xx response activates them. Five consecutive probation failures or ten consecutive established failures pause delivery.
 - Hosted actions require an encrypted ER:LC server key and run through a durable worker with cooldown and account budgets.
+- Ingested events and their fan-out jobs commit together. Forwarding jobs are reclaimed after a five-minute worker lease; interrupted hosted-command jobs are marked uncertain instead of repeating a possibly-sent ER:LC command.
 - Every outbound ER:LC request sends the server's key in `Server-Key` and the public application's global key in `Authorization`. No outbound ER:LC request runs when the global key is missing. Keep the global key only in the private gateway environment file, never in the dashboard, SDK, repository, or logs.
 - ER:LC command requests share an application-wide cooldown. Any 429 pauses outbound requests for the provider's full `Retry-After` period; global-key authentication failures pause requests for an hour to avoid repeated invalid calls. A rejected global key never clears a user's server key.
 - Server owners may need to approve hosted commands through an ER:LC authorization link. The dashboard builds that link from the non-secret App ID and the server's Internal Server ID.

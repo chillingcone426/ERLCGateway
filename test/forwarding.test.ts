@@ -60,6 +60,18 @@ test("raw mirror preserves exact body and official signature headers", async () 
   assert.equal((await value.store.getDestination(destination.id))?.healthState, "active");
 });
 
+test("an interrupted forwarding job becomes claimable after its lease expires", async () => {
+  const value = fixture();
+  await value.store.enqueueDelivery({ id: "del_interrupted", destinationId: "dst_1", eventId: value.event.id,
+    attempt: 0, state: "pending", availableAt: value.now, createdAt: value.now });
+  assert.equal((await value.store.claimDeliveries(10, value.now)).length, 1);
+  const beforeExpiry = new Date(Date.parse(value.now) + 4 * 60_000).toISOString();
+  assert.equal((await value.store.claimDeliveries(10, beforeExpiry)).length, 0);
+  const afterExpiry = new Date(Date.parse(value.now) + 5 * 60_000).toISOString();
+  const recovered = await value.store.claimDeliveries(10, afterExpiry);
+  assert.equal(recovered[0]?.id, "del_interrupted");
+});
+
 test("a raw batch is mirrored once while normalized events remain separate", async () => {
   const value = fixture();
   await value.store.createConnection(value.connection);

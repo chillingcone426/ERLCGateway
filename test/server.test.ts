@@ -18,8 +18,7 @@ function setup() {
   };
   const store = new MemoryGatewayStore();
   const managementHeaders = { authorization: "Bearer management-test", "x-liberty-account-id": "acct_a" };
-  const sign = (payload: string) => {
-    const timestamp = String(Math.floor(Date.now() / 1000));
+  const sign = (payload: string, timestamp = String(Math.floor(Date.now() / 1000))) => {
     return {
       "content-type": "application/json",
       "x-signature-timestamp": timestamp,
@@ -152,6 +151,23 @@ test("signed ingestion deduplicates and Poll subscriptions acknowledge independe
   const secondAfter = await app.inject({ method: "GET", url: `/v1/poll/subscriptions/${subscriptions[1]!.subscription.id}/events`, headers: { authorization: `Bearer ${subscriptions[1]!.pollToken}` } });
   assert.equal(firstAfter.json().events.length, 0);
   assert.equal(secondAfter.json().events.length, 1);
+  await app.close();
+});
+
+test("identical webhook bodies with different signed timestamps are separate events", async () => {
+  const value = setup();
+  const { app } = await createApp({ config: value.config, store: value.store });
+  const connection = await createConnection(app, value.managementHeaders);
+  const payload = JSON.stringify({ event: "CustomCommand", command: "help", userId: "42" });
+  const timestamp = Math.floor(Date.now() / 1_000);
+  const first = await app.inject({ method: "POST", url: `/v1/ingest/${connection.publicId}`,
+    headers: value.sign(payload, String(timestamp)), payload });
+  const second = await app.inject({ method: "POST", url: `/v1/ingest/${connection.publicId}`,
+    headers: value.sign(payload, String(timestamp + 1)), payload });
+  assert.equal(first.statusCode, 202);
+  assert.equal(second.statusCode, 202);
+  assert.equal(second.json().duplicate, false);
+  assert.equal(value.store.events.size, 2);
   await app.close();
 });
 

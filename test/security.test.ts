@@ -44,4 +44,8 @@ test("allows public HTTP self-hosting while blocking internal networks", async (
   await assert.rejects(() => validateDestinationUrl("ftp://8.8.8.8/events"), /HTTP or HTTPS/);
   await assert.rejects(() => validateDestinationUrl("http://8.8.8.8:22/events"), /port is not allowed/);
   assert.equal(isBlockedAddress("169.254.169.254"), true);
+  assert.equal(isBlockedAddress("::ffff:a9fe:a9fe"), true);
+  assert.equal(isBlockedAddress("::ffff:ac10:1"), true);
+  assert.equal(isBlockedAddress("::ffff:169.254.169.254"), true);
+  assert.equal(isBlockedAddress("::ffff:808:808"), false);
 });

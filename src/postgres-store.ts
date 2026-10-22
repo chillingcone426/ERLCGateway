@@ -3,6 +3,7 @@ import path from "node:path";
 import { Pool, type PoolClient, type QueryResultRow } from "pg";
 import { encodeCursor } from "./normalization.js";
 import { eventMatchesSubscription } from "./memory-store.js";
+import { randomId } from "./security.js";
 import type { EventQuery, GatewayStore } from "./store.js";
 import type {
   AuditEntry,
@@ -205,11 +206,43 @@ export class PostgresGatewayStore implements GatewayStore {
     const existing = await this.pool.query("SELECT * FROM events WHERE connection_id=$1 AND dedupe_key=$2", [value.connectionId, value.dedupeKey]);
     return { inserted: false, event: eventFromRow(existing.rows[0]) };
   }
+  async saveEventWithJobs(value: GatewayEvent, deliveries: DeliveryJob[], rules: RuleJob[]) {
+    return this.transaction(async client => {
+      const result = await client.query(`INSERT INTO events
+        (id,connection_id,type,original_type,occurred_at,received_at,server_id,data,raw_body,original_headers,synthetic,dedupe_key)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+        ON CONFLICT(connection_id,dedupe_key) DO NOTHING RETURNING *`, [value.id, value.connectionId, value.type,
+        value.originalType ?? null, value.occurredAt, value.receivedAt, value.serverId ?? null, JSON.stringify(value.data),
+        value.rawBody, JSON.stringify(value.originalHeaders), value.synthetic, value.dedupeKey]);
+      if (!result.rows[0]) {
+        const existing = await client.query("SELECT * FROM events WHERE connection_id=$1 AND dedupe_key=$2",
+          [value.connectionId, value.dedupeKey]);
+        return { inserted: false, event: eventFromRow(existing.rows[0]) };
+      }
+      for (const job of deliveries) {
+        await client.query(`INSERT INTO delivery_jobs(id,destination_id,event_id,attempt,state,available_at,created_at,last_error_code)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(destination_id,event_id) DO NOTHING`,
+        [job.id, job.destinationId, job.eventId, job.attempt, job.state, job.availableAt, job.createdAt, job.lastErrorCode ?? null]);
+      }
+      for (const job of rules) {
+        await client.query(`INSERT INTO rule_jobs(id,rule_id,event_id,revision,attempt,state,available_at,created_at,last_error_code)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(rule_id,event_id) DO NOTHING`,
+        [job.id, job.ruleId, job.eventId, job.revision ?? null, job.attempt, job.state, job.availableAt,
+          job.createdAt, job.lastErrorCode ?? null]);
+      }
+      return { inserted: true, event: eventFromRow(result.rows[0]) };
+    });
+  }
   async getEvent(id: string) {
     const result = await this.pool.query("SELECT * FROM events WHERE id=$1", [id]);
     return result.rows[0] ? eventFromRow(result.rows[0]) : undefined;
   }
   async listEvents(connectionId: string, query: EventQuery): Promise<EventPage> {
+    const subscription = query.pendingForSubscriptionId
+      ? await this.getPollSubscription(query.pendingForSubscriptionId) : undefined;
+    if (query.pendingForSubscriptionId && !subscription) {
+      return { events: [], nextCursor: null, hasMore: false, pendingCount: 0 };
+    }
     const values: unknown[] = [connectionId];
     const clauses = ["e.connection_id=$1"];
     if (query.cursor) {
@@ -221,25 +254,30 @@ export class PostgresGatewayStore implements GatewayStore {
       values.push(query.pendingForSubscriptionId);
       clauses.push(`NOT EXISTS (SELECT 1 FROM poll_acknowledgements a WHERE a.subscription_id=$${values.length} AND a.event_id=e.id)`);
     }
+    if (subscription?.eventTypes.length && !subscription.eventTypes.includes("*")) {
+      values.push(subscription.eventTypes);
+      clauses.push(`e.type = ANY($${values.length}::text[])`);
+    }
+    if (subscription?.includedCommands.length) {
+      values.push(subscription.includedCommands);
+      clauses.push(`(e.type <> 'CustomCommand' OR lower(coalesce(e.data->>'command','')) = ANY($${values.length}::text[]))`);
+    }
+    if (subscription?.excludedCommands.length) {
+      values.push(subscription.excludedCommands);
+      clauses.push(`(e.type <> 'CustomCommand' OR NOT (lower(coalesce(e.data->>'command','')) = ANY($${values.length}::text[])))`);
+    }
     values.push(Math.min(query.limit + 1, 101));
     const result = await this.pool.query(`SELECT e.* FROM events e WHERE ${clauses.join(" AND ")}
       ORDER BY e.received_at, e.id LIMIT $${values.length}`, values);
-    let events = result.rows.map(eventFromRow);
-    if (query.pendingForSubscriptionId) {
-      const subscription = await this.getPollSubscription(query.pendingForSubscriptionId);
-      events = subscription ? events.filter(event => eventMatchesSubscription(event, subscription)) : [];
-    }
+    const events = result.rows.map(eventFromRow);
     const hasMore = events.length > query.limit;
     const page = events.slice(0, query.limit);
     let pendingCount = 0;
-    if (query.pendingForSubscriptionId) {
-      const subscription = await this.getPollSubscription(query.pendingForSubscriptionId);
-      if (subscription) {
+    if (query.pendingForSubscriptionId && subscription) {
         const pending = await this.pool.query(`SELECT e.* FROM events e WHERE e.connection_id=$1 AND
           NOT EXISTS (SELECT 1 FROM poll_acknowledgements a WHERE a.subscription_id=$2 AND a.event_id=e.id)`,
           [connectionId, query.pendingForSubscriptionId]);
         pendingCount = pending.rows.map(eventFromRow).filter(event => eventMatchesSubscription(event, subscription)).length;
-      }
     }
     return {
       events: page, nextCursor: page.length ? encodeCursor(page[page.length - 1]!) : null, hasMore,
@@ -273,11 +311,13 @@ export class PostgresGatewayStore implements GatewayStore {
   }
   async claimDeliveries(limit: number, now: string) {
     return this.transaction(async client => {
-      const result = await client.query(`SELECT * FROM delivery_jobs WHERE state='pending' AND available_at <= $1
+      const result = await client.query(`SELECT * FROM delivery_jobs WHERE state IN ('pending','running') AND available_at <= $1
         ORDER BY available_at FOR UPDATE SKIP LOCKED LIMIT $2`, [now, limit]);
       if (!result.rows.length) return [];
-      await client.query("UPDATE delivery_jobs SET state='running' WHERE id=ANY($1::text[])", [result.rows.map(row => row.id)]);
-      return result.rows.map(row => deliveryFromRow({ ...row, state: "running" }));
+      const leaseUntil = new Date(Date.parse(now) + 5 * 60_000).toISOString();
+      await client.query("UPDATE delivery_jobs SET state='running',available_at=$2 WHERE id=ANY($1::text[])",
+        [result.rows.map(row => row.id), leaseUntil]);
+      return result.rows.map(row => deliveryFromRow({ ...row, state: "running", available_at: leaseUntil }));
     });
   }
   async updateDelivery(value: DeliveryJob) {
@@ -362,19 +402,32 @@ export class PostgresGatewayStore implements GatewayStore {
     }));
   }
   async enqueueRuleJob(value: RuleJob) {
-    const result = await this.pool.query(`INSERT INTO rule_jobs(id,rule_id,event_id,attempt,state,available_at,created_at,last_error_code)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(rule_id,event_id) DO NOTHING RETURNING id`,
-      [value.id, value.ruleId, value.eventId, value.attempt, value.state, value.availableAt, value.createdAt, value.lastErrorCode ?? null]);
+    const result = await this.pool.query(`INSERT INTO rule_jobs(id,rule_id,event_id,revision,attempt,state,available_at,created_at,last_error_code)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(rule_id,event_id) DO NOTHING RETURNING id`,
+      [value.id, value.ruleId, value.eventId, value.revision ?? null, value.attempt, value.state,
+        value.availableAt, value.createdAt, value.lastErrorCode ?? null]);
     return Boolean(result.rowCount);
   }
   async claimRuleJobs(limit: number, now: string) {
     return this.transaction(async client => {
+      const interrupted = await client.query(`UPDATE rule_jobs SET state='failed',last_error_code='worker_interrupted'
+        WHERE state='running' AND available_at <= $1 RETURNING rule_id,event_id`, [now]);
+      for (const row of interrupted.rows) {
+        await client.query(`INSERT INTO rule_executions(id,rule_id,event_id,status,detail,created_at,completed_at)
+          SELECT $1,$2,$3,'uncertain',$4,$5,$5 WHERE NOT EXISTS
+          (SELECT 1 FROM rule_executions WHERE rule_id=$2 AND event_id=$3)`,
+        [randomId("exe"), row.rule_id, row.event_id,
+          JSON.stringify({ code: "worker_interrupted", reason: "Execution may have reached ER:LC; no automatic retry was sent." }), now]);
+      }
       const result = await client.query(`SELECT * FROM rule_jobs WHERE state='pending' AND available_at <= $1
         ORDER BY available_at FOR UPDATE SKIP LOCKED LIMIT $2`, [now, limit]);
       if (!result.rows.length) return [];
-      await client.query("UPDATE rule_jobs SET state='running' WHERE id=ANY($1::text[])", [result.rows.map(row => row.id)]);
+      const leaseUntil = new Date(Date.parse(now) + 5 * 60_000).toISOString();
+      await client.query("UPDATE rule_jobs SET state='running',available_at=$2 WHERE id=ANY($1::text[])",
+        [result.rows.map(row => row.id), leaseUntil]);
       return result.rows.map(row => ({ id: String(row.id), ruleId: String(row.rule_id), eventId: String(row.event_id),
-        attempt: Number(row.attempt), state: "running" as const, availableAt: iso(row.available_at), createdAt: iso(row.created_at),
+        ...(row.revision !== null && row.revision !== undefined ? { revision: Number(row.revision) } : {}),
+        attempt: Number(row.attempt), state: "running" as const, availableAt: leaseUntil, createdAt: iso(row.created_at),
         ...(row.last_error_code ? { lastErrorCode: String(row.last_error_code) } : {}) }));
     });
   }

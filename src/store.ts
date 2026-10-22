@@ -45,6 +45,7 @@ export interface GatewayStore {
   deleteDestination(id: string): Promise<void>;
 
   saveEvent(event: GatewayEvent): Promise<{ inserted: boolean; event: GatewayEvent }>;
+  saveEventWithJobs(event: GatewayEvent, deliveries: DeliveryJob[], rules: RuleJob[]): Promise<{ inserted: boolean; event: GatewayEvent }>;
   getEvent(id: string): Promise<GatewayEvent | undefined>;
   listEvents(connectionId: string, query: EventQuery): Promise<EventPage>;
   acknowledgeEvents(subscriptionId: string, eventIds: string[], acknowledgedAt: string): Promise<{

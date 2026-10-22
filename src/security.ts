@@ -91,6 +91,26 @@ function blockedIpv4(address: string) {
 
 function blockedIpv6(address: string) {
   const normalized = address.toLowerCase();
+  const dottedMapped = normalized.match(/^(?:(?:0:){5}ffff:|::ffff:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (dottedMapped && net.isIP(dottedMapped[1]!) === 4) return blockedIpv4(dottedMapped[1]!);
+  // IPv4-mapped addresses may be returned as hex groups (for example
+  // ::ffff:a9fe:a9fe). Classify the embedded IPv4 address before allowing it.
+  const expanded = normalized.split("::");
+  if (expanded.length <= 2) {
+    const left = expanded[0] ? expanded[0].split(":") : [];
+    const right = expanded.length === 2 && expanded[1] ? expanded[1].split(":") : [];
+    const groups = expanded.length === 2
+      ? [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill("0"), ...right]
+      : left;
+    if (groups.length === 8 && groups.slice(0, 5).every(group => parseInt(group, 16) === 0) &&
+      parseInt(groups[5]!, 16) === 0xffff) {
+      const high = parseInt(groups[6]!, 16);
+      const low = parseInt(groups[7]!, 16);
+      if (Number.isInteger(high) && Number.isInteger(low)) {
+        return blockedIpv4(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`);
+      }
+    }
+  }
   return normalized === "::" || normalized === "::1" || normalized.startsWith("fe8") ||
     normalized.startsWith("fe9") || normalized.startsWith("fea") || normalized.startsWith("feb") ||
     normalized.startsWith("fc") || normalized.startsWith("fd") || normalized.startsWith("ff") ||

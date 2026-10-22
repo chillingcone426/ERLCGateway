@@ -3,7 +3,7 @@ import { erlcHeaders, erlcRetryAfterMs } from "./erlc.js";
 import { RUNTIME_LIMITS } from "./limits.js";
 import { decryptSecret, randomId } from "./security.js";
 import type { GatewayStore } from "./store.js";
-import type { GatewayEvent, Rule, RuleAction, RuleDefinition, RuleExecution } from "./types.js";
+import type { GatewayEvent, Rule, RuleAction, RuleDefinition, RuleExecution, RuleJob } from "./types.js";
 
 function commandName(event: GatewayEvent) {
   return event.type === "CustomCommand" && typeof event.data.command === "string"
@@ -45,6 +45,16 @@ export function validateRuleDefinition(value: unknown, limits = { conditions: 10
   const actions = Array.isArray(input.actions) ? input.actions : [];
   if (conditions.length > limits.conditions || actions.length < 1 || actions.length > limits.actions) {
     throw Object.assign(new Error("Rule condition or action limit exceeded"), { code: "limit_reached" });
+  }
+  for (const condition of conditions) {
+    if (!condition || typeof condition !== "object" ||
+      !((condition.field === "command.argument" && condition.operator === "exists") ||
+        (condition.field === "command.argument" && ["equals", "contains"].includes(condition.operator) &&
+          typeof condition.value === "string" && condition.value.length <= 200) ||
+        (condition.field === "player.id" && condition.operator === "equals" &&
+          typeof condition.value === "string" && condition.value.length > 0 && condition.value.length <= 100))) {
+      throw Object.assign(new Error("Rule condition is invalid"), { code: "validation_failed" });
+    }
   }
   for (const action of actions) {
     if (!action || (action.type !== "privateReply" && action.type !== "announce") || typeof action.message !== "string") {
@@ -160,10 +170,15 @@ export class RuleEngine {
 
   async enqueue(event: GatewayEvent, rules?: Rule[]) {
     const matching = rules ?? await this.matchingRules(event);
-    const now = new Date(this.#now()).toISOString();
-    for (const rule of matching) await this.#store.enqueueRuleJob({ id: randomId("rjb"), ruleId: rule.id,
-      eventId: event.id, attempt: 0, state: "pending", availableAt: now, createdAt: now });
+    for (const job of this.planJobs(event, matching)) await this.#store.enqueueRuleJob(job);
     return matching.length;
+  }
+
+  planJobs(event: GatewayEvent, matching: Rule[]): RuleJob[] {
+    const now = new Date(this.#now()).toISOString();
+    return matching.map(rule => ({ id: randomId("rjb"), ruleId: rule.id, eventId: event.id,
+      ...(rule.activeRevision !== undefined ? { revision: rule.activeRevision } : {}),
+      attempt: 0, state: "pending" as const, availableAt: now, createdAt: now }));
   }
 
   async executeRule(rule: Rule, event: GatewayEvent) {
@@ -400,12 +415,14 @@ export class RuleWorker {
       for (const job of jobs) {
         const rule = await this.#store.getRule(job.ruleId);
         const event = await this.#store.getEvent(job.eventId);
-        if (!rule?.enabled || !rule.published || !event) {
+        const revision = rule && job.revision !== undefined
+          ? await this.#store.getRuleRevision(rule.id, job.revision) : undefined;
+        if (!rule?.enabled || !rule.published || !event || (job.revision !== undefined && !revision)) {
           await this.#store.updateRuleJob({ ...job, state: "cancelled", lastErrorCode: "rule_or_event_inactive" });
           continue;
         }
         try {
-          await this.#engine.executeRule(rule, event);
+          await this.#engine.executeRule(revision ? { ...rule, published: revision.definition } : rule, event);
           await this.#store.updateRuleJob({ ...job, attempt: job.attempt + 1, state: "succeeded" });
         } catch (error) {
           const attempt = job.attempt + 1;

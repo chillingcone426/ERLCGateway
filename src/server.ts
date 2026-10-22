@@ -2,7 +2,7 @@ import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import rawBody from "fastify-raw-body";
 import type { GatewayConfig } from "./config.js";
 import { erlcHeaders, erlcInternalServerId, erlcRetryAfterMs } from "./erlc.js";
-import { enqueueEventDeliveries, ForwardingWorker, legacyEasyEvent } from "./forwarding.js";
+import { planEventDeliveries, ForwardingWorker, legacyEasyEvent } from "./forwarding.js";
 import { DEFAULT_LIMITS, RUNTIME_LIMITS } from "./limits.js";
 import { decodeCursor, normalizeWebhookEvent, normalizeWebhookEvents } from "./normalization.js";
 import { MaintenanceWorker } from "./maintenance.js";
@@ -517,15 +517,15 @@ export async function createApp(options: CreateAppOptions) {
   app.post<{ Params: { id: string } }>("/v1/management/connections/:id/test-events", async (request, reply) => {
     const connection = await ownedConnection(store, request.params.id, accountId(request));
     const input = body(request);
-    const payload = { event: input.type ?? "CustomCommand", type: input.type ?? "CustomCommand", data: input.data ?? {}, synthetic: true };
+    const payload = { event: input.type ?? "CustomCommand", type: input.type ?? "CustomCommand", data: input.data ?? {},
+      synthetic: true, sampleId: randomId("sample") };
     const raw = Buffer.from(JSON.stringify(payload));
     const event = normalizeWebhookEvent({ connectionId: connection.id, rawBody: raw, payload, headers: {}, synthetic: true });
-    const saved = await store.saveEvent(event);
-    const matchingRules = await ruleEngine.matchingRules(saved.event);
-    if (input.dryRun !== true) {
-      await enqueueEventDeliveries(store, saved.event, matchingRules.length > 0);
-      await ruleEngine.enqueue(saved.event, matchingRules);
-    }
+    const matchingRules = await ruleEngine.matchingRules(event);
+    const saved = input.dryRun === true ? await store.saveEvent(event) :
+      await store.saveEventWithJobs(event,
+        (await planEventDeliveries(store, event, matchingRules.length > 0)).jobs,
+        ruleEngine.planJobs(event, matchingRules));
     return reply.code(202).send({ accepted: true, event: eventJson(saved.event), dryRun: input.dryRun === true });
   });
 
@@ -689,13 +689,13 @@ export async function createApp(options: CreateAppOptions) {
     const savedEvents: GatewayEvent[] = [];
     let inserted = 0;
     for (const [index, event] of events.entries()) {
-      const saved = await store.saveEvent(event);
+      const matchingRules = await ruleEngine.matchingRules(event);
+      const deliveries = await planEventDeliveries(store, event, matchingRules.length > 0,
+        new Date().toISOString(), { rawBatchPrimary: index === 0 });
+      const saved = await store.saveEventWithJobs(event, deliveries.jobs, ruleEngine.planJobs(event, matchingRules));
       savedEvents.push(saved.event);
       if (saved.inserted) {
         inserted += 1;
-        const matchingRules = await ruleEngine.matchingRules(saved.event);
-        await enqueueEventDeliveries(store, saved.event, matchingRules.length > 0, new Date().toISOString(), { rawBatchPrimary: index === 0 });
-        await ruleEngine.enqueue(saved.event, matchingRules);
       }
     }
     return reply.code(202).send({

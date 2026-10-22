@@ -62,7 +62,7 @@ export function destinationMatchesEvent(destination: ForwardDestination, event: 
   return true;
 }
 
-export async function enqueueEventDeliveries(
+export async function planEventDeliveries(
   store: GatewayStore,
   event: GatewayEvent,
   hostedMatched: boolean,
@@ -70,7 +70,7 @@ export async function enqueueEventDeliveries(
   options: { rawBatchPrimary?: boolean } = {}
 ) {
   const destinations = await store.listDestinations(event.connectionId);
-  const enqueued: string[] = [];
+  const jobs: DeliveryJob[] = [];
   const skipped: Array<{ destinationId: string; reason: string }> = [];
   for (const destination of destinations) {
     if (options.rawBatchPrimary === false && (destination.type === "rawMirror" || destination.type === "legacyEasy")) {
@@ -90,13 +90,27 @@ export async function enqueueEventDeliveries(
       skipped.push({ destinationId: destination.id, reason: "queue_full" });
       continue;
     }
-    const id = randomId("del");
-    const inserted = await store.enqueueDelivery({
-      id, destinationId: destination.id, eventId: event.id, attempt: 0,
+    jobs.push({
+      id: randomId("del"), destinationId: destination.id, eventId: event.id, attempt: 0,
       state: "pending", availableAt: now, createdAt: now
     });
-    if (inserted) enqueued.push(id);
-    else skipped.push({ destinationId: destination.id, reason: "duplicate" });
+  }
+  return { jobs, skipped };
+}
+
+export async function enqueueEventDeliveries(
+  store: GatewayStore,
+  event: GatewayEvent,
+  hostedMatched: boolean,
+  now = new Date().toISOString(),
+  options: { rawBatchPrimary?: boolean } = {}
+) {
+  const plan = await planEventDeliveries(store, event, hostedMatched, now, options);
+  const enqueued: string[] = [];
+  const skipped = [...plan.skipped];
+  for (const job of plan.jobs) {
+    if (await store.enqueueDelivery(job)) enqueued.push(job.id);
+    else skipped.push({ destinationId: job.destinationId, reason: "duplicate" });
   }
   return { enqueued, skipped };
 }

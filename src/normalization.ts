@@ -76,6 +76,8 @@ function normalizeOne(options: NormalizeWebhookOptions, payload: unknown, envelo
   const dedupeKey = crypto.createHash("sha256")
     .update(options.connectionId)
     .update("\0")
+    .update(options.headers["x-signature-timestamp"] ?? "")
+    .update("\0")
     .update(options.rawBody)
     .update(batchIndex === undefined ? "" : `\0batch:${batchIndex}`)
     .digest("hex");
